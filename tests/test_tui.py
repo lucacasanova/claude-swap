@@ -392,6 +392,28 @@ class TestFormatting:
         no_probe = account_card_text(make_account(1, active=True), 80).plain
         assert "hot-zone" not in no_probe
 
+    def test_hot_probe_pct_overrides_the_stale_5h_7d_bars(self):
+        # The default entry's official reading is 5h=25%/7d=10% (stale by
+        # the time a hot-zone probe fires) — the fresh probe's numbers must
+        # win on the matching bar row, tagged "live", not dimmed as stale.
+        from claude_swap.tui.widgets import account_card_text
+
+        hot_probe = {"number": "1", "at": 0.0, "session_pct": 96.0, "week_pct": 20.0}
+        watched = account_card_text(
+            make_account(1, active=True), 80, hot_probe=hot_probe
+        ).plain
+
+        assert "96%" in watched  # fresh 5h reading, not the stale 25%
+        assert "20%" in watched  # fresh 7d reading, not the stale 10%
+        assert "25%" not in watched
+        assert "10%" not in watched
+        assert watched.count("live") == 2  # one tag per overridden row
+
+        # Without a probe for THIS account, the official numbers stand.
+        untouched = account_card_text(make_account(1, active=True), 80).plain
+        assert "25%" in untouched
+        assert "live" not in untouched
+
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
         from claude_swap.tui.widgets import account_card_text

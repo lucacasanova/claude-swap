@@ -511,6 +511,30 @@ def _probe_env(session_dir: Path) -> dict[str, str]:
     return env
 
 
+def _spawn_in_session(
+    argv_tail: list[str], session_dir: Path, timeout: float
+) -> subprocess.CompletedProcess | None:
+    """Run ``claude <argv_tail...>`` in ``session_dir``'s isolated env.
+
+    Shared by every one-shot headless call through an isolated profile
+    (`ping_to_warm`, `fetch_hot_usage`) — same binary resolution, same env,
+    same timeout/spawn-failure handling. Returns ``None`` on a timeout or a
+    spawn failure (binary missing, etc.); callers treat that the same as a
+    non-zero exit.
+    """
+    claude_bin = shutil.which("claude") or "claude"
+    try:
+        return subprocess.run(
+            [claude_bin, *argv_tail],
+            env=_probe_env(session_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 class SessionManager:
     """Bootstraps per-account session profiles and launches Claude into them."""
 
@@ -518,6 +542,8 @@ class SessionManager:
         self.switcher = switcher
         self.sessions_dir = switcher.backup_dir / "sessions"
         self._logger = switcher._logger
+        # `fetch_hot_usage`'s own cache — see its docstring.
+        self._hot_usage_dirs: dict[str, Path] = {}
 
     # -- launch ----------------------------------------------------------
 
@@ -838,18 +864,10 @@ class SessionManager:
             session_dir, _num, _email = self.setup_session(identifier, share=False)
         except SessionError:
             return False
-        claude_bin = shutil.which("claude") or "claude"
-        try:
-            result = subprocess.run(
-                [claude_bin, "-p", "hi", "--model", "haiku"],
-                env=_probe_env(session_dir),
-                capture_output=True,
-                text=True,
-                timeout=_WARM_PING_TIMEOUT,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return False
-        return result.returncode == 0
+        result = _spawn_in_session(
+            ["-p", "hi", "--model", "haiku"], session_dir, _WARM_PING_TIMEOUT
+        )
+        return result is not None and result.returncode == 0
 
     def fetch_hot_usage(self, identifier: str) -> dict[str, float] | None:
         """Read ``identifier``'s live "Current session"/"Current week" pct
@@ -864,31 +882,35 @@ class SessionManager:
         testing well past that budget. Meant for `autoswitch._hot_zone_decide`'s
         tight-cadence probing once the active account nears its real limit.
 
+        Caches ``identifier``'s session dir across calls: hot-zone calls
+        this every 20-60s for the same account, and `setup_session`'s reuse
+        path still spawns a full `claude auth status` probe and re-syncs
+        sharing on every call — needless work when nothing about the
+        profile can have changed between one probe and the next. A cache
+        hit skips straight to the `/usage` spawn; a failed spawn evicts the
+        entry so the *next* call re-validates (and re-bootstraps if truly
+        needed) instead of hammering a profile that may have gone stale.
+
         Returns ``{"session_pct": ..., "week_pct": ...}`` — each the max
         across every matching line (folding in any scoped per-model weekly
         window automatically) — or ``None`` on any failure: bootstrap,
         spawn, timeout, non-zero exit, unparseable JSON, or a panel shape
         that doesn't match what's parsed here.
         """
-        try:
-            session_dir, _num, _email = self.setup_session(identifier, share=False)
-        except SessionError:
-            return None
-        claude_bin = shutil.which("claude") or "claude"
-        try:
-            result = subprocess.run(
-                [
-                    claude_bin, "-p", "/usage", "--model", "haiku",
-                    "--output-format", "json",
-                ],
-                env=_probe_env(session_dir),
-                capture_output=True,
-                text=True,
-                timeout=_HOT_USAGE_TIMEOUT,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-        if result.returncode != 0:
+        session_dir = self._hot_usage_dirs.get(identifier)
+        if session_dir is None:
+            try:
+                session_dir, _num, _email = self.setup_session(identifier, share=False)
+            except SessionError:
+                return None
+            self._hot_usage_dirs[identifier] = session_dir
+
+        result = _spawn_in_session(
+            ["-p", "/usage", "--model", "haiku", "--output-format", "json"],
+            session_dir, _HOT_USAGE_TIMEOUT,
+        )
+        if result is None or result.returncode != 0:
+            self._hot_usage_dirs.pop(identifier, None)
             return None
         try:
             payload = json.loads(result.stdout)

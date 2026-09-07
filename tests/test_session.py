@@ -1005,6 +1005,49 @@ class TestFetchHotUsage:
         ]
         assert seen["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path)
 
+    def test_repeat_calls_reuse_the_session_dir_without_resetting_up(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """Hot-zone calls this every 20-60s for the same account —
+        `setup_session`'s reuse path still spawns its own probe and
+        re-syncs sharing on every call, so a second call for the same
+        identifier must skip straight to the `/usage` spawn."""
+        setup_calls = []
+        monkeypatch.setattr(
+            manager,
+            "setup_session",
+            lambda identifier, share=False, share_history=False: (
+                setup_calls.append(identifier) or (tmp_path, ACCOUNT_NUM, ACCOUNT_EMAIL)
+            ),
+        )
+        self._mock_run(
+            monkeypatch,
+            stdout=self._payload("Current session: 1% used\nCurrent week: 2% used\n"),
+        )
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is not None
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is not None
+        assert setup_calls == [ACCOUNT_NUM], "setup_session must run only once"
+
+    def test_a_failed_spawn_evicts_the_cached_dir_so_the_next_call_revalidates(
+        self, manager, tmp_path, monkeypatch
+    ):
+        setup_calls = []
+        monkeypatch.setattr(
+            manager,
+            "setup_session",
+            lambda identifier, share=False, share_history=False: (
+                setup_calls.append(identifier) or (tmp_path, ACCOUNT_NUM, ACCOUNT_EMAIL)
+            ),
+        )
+        self._mock_run(monkeypatch, returncode=1, stderr="stale session")
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+        assert setup_calls == [ACCOUNT_NUM, ACCOUNT_NUM], (
+            "a failed spawn must evict the cache so the profile is "
+            "re-validated (and re-bootstrapped if needed) next time, "
+            "instead of repeatedly hammering a profile that went stale"
+        )
+
 
 # ---------------------------------------------------------------------------
 # sharing

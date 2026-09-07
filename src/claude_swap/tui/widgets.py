@@ -187,7 +187,11 @@ def account_card_text(
     probes instead of the slow official poll
     (`autoswitch._hot_zone_decide`) — same additive-tag treatment, also
     never affects ``is_active``. Tagged with the binding (worst) of the
-    two, matching what actually decides the switch.
+    two, matching what actually decides the switch. It also overrides the
+    matching 5h/7d bar row with the fresher probed pct (tagged "live",
+    never dimmed stale) — the whole point of hot-zone is that the
+    official reading behind the ordinary bar can be meaningfully behind
+    it while a probe is active.
     """
     now = now if now is not None else time.time()
     pinging_target = str(pinging["number"]) if pinging and "number" in pinging else None
@@ -236,6 +240,30 @@ def account_card_text(
         return text
 
     rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
+
+    # While hot-zone is watching this account, the fresh `/usage` reading
+    # is more current than whatever the official endpoint's own (slower)
+    # cadence last stored — show that number on the matching row instead
+    # of the stale one, tagged "live" so it's clear the two can briefly
+    # disagree with the endpoint's own age display.
+    live_pcts = (
+        {"5h": hot_probe.get("session_pct"), "7d": hot_probe.get("week_pct")}
+        if acc.number == hot_probe_target and isinstance(hot_probe, dict)
+        else {}
+    )
+    live_labels: set[str] = set()
+    if live_pcts:
+        new_rows = []
+        for label, pct, suffix, suffix_full in rows:
+            live = live_pcts.get(label)
+            if isinstance(live, (int, float)):
+                live_labels.add(label)
+                pct = live
+                suffix = f"live · {suffix}" if suffix else "live"
+                suffix_full = f"live · {suffix_full}" if suffix_full else "live"
+            new_rows.append((label, pct, suffix, suffix_full))
+        rows = new_rows
+
     if not rows:
         text.append("\n    ")
         text.append("usage unavailable", style=palette.muted)
@@ -264,7 +292,7 @@ def account_card_text(
                 pct,
                 suffix or None,
                 bar_width,
-                stale=stale,
+                stale=False if label in live_labels else stale,
                 threshold=threshold,
                 palette=palette,
             )
