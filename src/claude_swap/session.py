@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -204,6 +205,20 @@ _AUTH_STATUS_TIMEOUT = 10.0
 # local auth-status probe above), so it needs real headroom past a network
 # call plus a short Haiku completion.
 _WARM_PING_TIMEOUT = 60.0
+
+# `fetch_hot_usage`'s `/usage` is handled entirely client-side (no model
+# turn — measured `duration_api_ms: 0`), consistently under ~1s in
+# testing; generous margin, still well under the tightest hot-zone tier
+# (poll_policy.HOT_TIER_3_S = 20s) so probes never stack up.
+_HOT_USAGE_TIMEOUT = 15.0
+
+# Matches both "Current session: 19% used" and "Current week (all
+# models): 49% used" (the parenthetical also covers a scoped per-model
+# weekly line, e.g. "Current week (Opus): 12% used") in `/usage`'s panel
+# text.
+_HOT_USAGE_RE = re.compile(
+    r"Current (session|week)\b[^\n%]*?(\d+(?:\.\d+)?)%\s*used"
+)
 
 # Bootstrap holds the backup-dir lock across one token refresh (10s network
 # timeout) plus auth-status probes, so it needs more headroom than the
@@ -835,6 +850,60 @@ class SessionManager:
         except (subprocess.TimeoutExpired, OSError):
             return False
         return result.returncode == 0
+
+    def fetch_hot_usage(self, identifier: str) -> dict[str, float] | None:
+        """Read ``identifier``'s live "Current session"/"Current week" pct
+        straight from the CLI's own ``/usage`` panel, through its isolated
+        session profile — never the active credential, same as
+        `ping_to_warm`.
+
+        Unlike the official ``/api/oauth/usage`` HTTP endpoint (rate-limited
+        to ~28-30 requests/hour, see ``poll_policy``'s module docstring),
+        ``/usage`` is a local CLI command handled entirely client-side — no
+        model turn, `$0`, zero tokens — and wasn't throttled at all in
+        testing well past that budget. Meant for `autoswitch._hot_zone_decide`'s
+        tight-cadence probing once the active account nears its real limit.
+
+        Returns ``{"session_pct": ..., "week_pct": ...}`` — each the max
+        across every matching line (folding in any scoped per-model weekly
+        window automatically) — or ``None`` on any failure: bootstrap,
+        spawn, timeout, non-zero exit, unparseable JSON, or a panel shape
+        that doesn't match what's parsed here.
+        """
+        try:
+            session_dir, _num, _email = self.setup_session(identifier, share=False)
+        except SessionError:
+            return None
+        claude_bin = shutil.which("claude") or "claude"
+        try:
+            result = subprocess.run(
+                [
+                    claude_bin, "-p", "/usage", "--model", "haiku",
+                    "--output-format", "json",
+                ],
+                env=_probe_env(session_dir),
+                capture_output=True,
+                text=True,
+                timeout=_HOT_USAGE_TIMEOUT,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        text = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(text, str):
+            return None
+        pcts: dict[str, float] = {}
+        for label, value in _HOT_USAGE_RE.findall(text):
+            key = "session_pct" if label.lower() == "session" else "week_pct"
+            pcts[key] = max(pcts.get(key, 0.0), float(value))
+        if "session_pct" not in pcts or "week_pct" not in pcts:
+            return None
+        return pcts
 
     def _profile_matches_backup(
         self, session_dir: Path, account_num: str, email: str

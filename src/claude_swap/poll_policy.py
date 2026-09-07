@@ -146,6 +146,29 @@ ESCALATION_MARGIN_PCT = 15.0
 # usage is obsolete the moment the window rolls over.
 RESET_SLACK_S = 60.0
 
+# Hot-zone cadence: once the active account's binding utilization reaches
+# `settings.threshold`, the engine stops trusting the official
+# `/api/oauth/usage` endpoint's ~60s-floor cadence (see the module
+# docstring's budget numbers) and instead probes real usage via the
+# `claude` CLI's own `/usage` command through an isolated session profile
+# (`SessionManager.fetch_hot_usage`) — a channel that costs nothing and
+# isn't subject to that same budget (measured 2026-09-07: 8 calls at 4s
+# spacing, zero 429s), so it can be polled this tightly indefinitely.
+# Absolute breakpoints, not relative to `threshold`: what matters is how
+# close the account actually is to its real ceiling.
+HOT_TIER_1_S = 60.0  # pct < 96
+HOT_TIER_2_S = 30.0  # 96 <= pct < 99
+HOT_TIER_3_S = 20.0  # pct >= 99
+
+
+def hot_probe_interval_s(pct: float) -> float:
+    """Hot-zone probe cadence for a binding pct this close to 100%."""
+    if pct >= 99.0:
+        return HOT_TIER_3_S
+    if pct >= 96.0:
+        return HOT_TIER_2_S
+    return HOT_TIER_1_S
+
 
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
     """Utilization of the binding (worst) relevant window, or None."""

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 _EVENT_ROLES = {
     "switch": "accent",
     "warm-ping": "accent",
+    "hot-probe": "accent",
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
