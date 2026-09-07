@@ -37,9 +37,12 @@ class AutoSwitchSettings:
     at or above it the engine stops trusting the official usage endpoint's
     ~60s-floor polling cadence and switches to watching the account closely —
     reading real usage straight from the CLI's own ``/usage`` command through
-    an isolated session profile (``autoswitch._hot_zone_decide``), at cadence
-    tightening the closer that gets to 100% (``poll_policy.hot_probe_interval_s``).
-    The actual switch only happens once a fresh read reports 100%, so no real
+    an isolated session profile (``autoswitch._hot_zone_decide``). The 5h
+    window is watched from here with cadence tightening the closer that gets
+    to 100% (``poll_policy.hot_probe_interval_s``); the far slower-moving 7d
+    window only starts its own watch once it separately nears 100%
+    (``poll_policy.WEEK_HOT_ZONE_ENTRY_PCT``). The actual switch only
+    happens once a fresh read reports 100%, so no real
     quota is left on the table the way switching at a stale ``threshold``-ish
     reading used to (a heavy subagent turn easily burns past 90% before the
     next official poll catches it). 90 rather than 95 leaves margin for the

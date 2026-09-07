@@ -375,7 +375,7 @@ class TestFormatting:
         # the last probed pct.
         from claude_swap.tui.widgets import account_card_text
 
-        hot_probe = {"number": "1", "at": 0.0, "pct": 96.0}
+        hot_probe = {"number": "1", "at": 0.0, "session_pct": 96.0, "week_pct": 20.0}
 
         watched = account_card_text(
             make_account(1, active=True), 80, hot_probe=hot_probe

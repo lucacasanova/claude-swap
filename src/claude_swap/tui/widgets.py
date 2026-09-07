@@ -181,11 +181,13 @@ def account_card_text(
     credential (``acc.is_active``), completely unaffected by this; the
     account being pinged (``number``) additionally gets a "priming" tag.
 
-    ``hot_probe`` is the raw "hotProbe" entry (``{"number", "at", "pct"}``),
-    when the active account is past `threshold` and `cswap auto` is
-    watching it via isolated `/usage` probes instead of the slow official
-    poll (`autoswitch._hot_zone_decide`) — same additive-tag treatment,
-    also never affects ``is_active``.
+    ``hot_probe`` is the raw "hotProbe" entry (``{"number", "at",
+    "session_pct", "week_pct"}``), when the active account is past
+    `threshold` and `cswap auto` is watching it via isolated `/usage`
+    probes instead of the slow official poll
+    (`autoswitch._hot_zone_decide`) — same additive-tag treatment, also
+    never affects ``is_active``. Tagged with the binding (worst) of the
+    two, matching what actually decides the switch.
     """
     now = now if now is not None else time.time()
     pinging_target = str(pinging["number"]) if pinging and "number" in pinging else None
@@ -206,8 +208,10 @@ def account_card_text(
     if acc.number == pinging_target:
         text.append("   ◐ priming", style=f"bold {palette.sev_warn}")
     if acc.number == hot_probe_target:
-        pct = hot_probe.get("pct") if isinstance(hot_probe, dict) else None
-        label = f"   ◑ hot-zone {pct:.0f}%" if isinstance(pct, (int, float)) else "   ◑ hot-zone"
+        session_pct = hot_probe.get("session_pct") if isinstance(hot_probe, dict) else None
+        week_pct = hot_probe.get("week_pct") if isinstance(hot_probe, dict) else None
+        pcts = [p for p in (session_pct, week_pct) if isinstance(p, (int, float))]
+        label = f"   ◑ hot-zone {max(pcts):.0f}%" if pcts else "   ◑ hot-zone"
         text.append(label, style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)

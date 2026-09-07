@@ -7293,7 +7293,9 @@ class TestHotZone:
         assert probe.status == "ok"
         assert probe.session_pct == 96.0
         assert probe.week_pct == 20.0
-        assert h.state()["hotProbe"] == {"number": "1", "at": h.clock.now, "pct": 96.0}
+        assert h.state()["hotProbe"] == {
+            "number": "1", "at": h.clock.now, "session_pct": 96.0, "week_pct": 20.0,
+        }
 
     def test_week_pct_binding_switches_even_when_session_pct_is_low(
         self, temp_home, monkeypatch
@@ -7397,3 +7399,87 @@ class TestHotZone:
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "at-limit"
         assert switch.dry_run is True
+
+    def test_week_alone_between_threshold_and_98_is_never_probed(
+        self, temp_home, monkeypatch
+    ):
+        """The week (7d) axis doesn't engage its own probing until 98% —
+        90-97% with a low session pct is nothing to watch tightly yet."""
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 5.0, "week_pct": 93.0})
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 93.0}},
+            "2": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == [], "week at 93% (< WEEK_HOT_ZONE_ENTRY_PCT) must not be probed"
+
+    def test_week_crossing_98_engages_its_own_fixed_cadence(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 5.0, "week_pct": 98.5})
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 98.5}},
+            "2": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == ["1"]
+        probe = next(e for e in h.events if isinstance(e, HotProbeEvent))
+        assert probe.week_pct == 98.5
+        assert h.state()["hotProbe"]["week_pct"] == 98.5
+        assert h.engine._hot_zone_deadline_ts == (
+            h.clock.now + poll_policy.WEEK_HOT_PROBE_INTERVAL_S
+        ), "week-only engagement uses its own fixed cadence, not the session tiers"
+
+    def test_week_hitting_100_switches_even_with_a_wide_open_session(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        self._mock_probe(h, monkeypatch, {"session_pct": 5.0, "week_pct": 100.0})
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 98.5}},
+            "2": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_both_axes_engaged_still_cost_a_single_probe_call(
+        self, temp_home, monkeypatch
+    ):
+        """Session at 96% and week at 98% are both individually engaged —
+        one `/usage` call reports both numbers, so this must never spawn
+        two separate probes for the same tick."""
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 96.0, "week_pct": 98.0})
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 98.0}},
+            "2": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == ["1"], f"expected exactly one probe call, got {calls}"
+        # The tighter of the two engaged cadences wins (session's tier-2
+        # 30s, same as week's fixed 30s here) — never a slower one.
+        assert h.engine._hot_zone_deadline_ts == h.clock.now + poll_policy.HOT_TIER_2_S
+
+    def test_probe_failures_do_not_carry_over_to_a_different_active_account(
+        self, temp_home, monkeypatch
+    ):
+        """A consecutive-failure count racked up on one account must not
+        trip the safety net on a different account's very first failure."""
+        h = self._harness(temp_home)
+        h.engine._hot_zone_failures = HOT_ZONE_MAX_PROBE_FAILURES - 1
+        h.engine._hot_zone_failures_for = "1"
+        h.make_live("b@example.com", 2)  # account 2 is active now
+        self._mock_probe(h, monkeypatch, None)
+
+        outcome = h.tick_with_usage({"1": _usage(10), "2": _usage(95)})
+
+        assert outcome is TickOutcome.NO_ACTION, (
+            "one failure on a freshly-active account must not immediately "
+            "trip the fallback just because a different account had "
+            "already accumulated failures"
+        )
+        assert h.engine._hot_zone_failures == 1
+        assert h.engine._hot_zone_failures_for == "2"

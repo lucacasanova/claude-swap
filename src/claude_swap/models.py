@@ -168,9 +168,9 @@ class AccountsSnapshot:
     pinging: dict | None = None
     # The active account's hot-zone state (`autoswitch._hot_zone_decide`),
     # straight from `autoswitch_state.json`'s "hotProbe" key
-    # (``{"number", "at", "pct"}``) if some `cswap auto` has it past
-    # `threshold` right now, else ``None``. Display-only, same as
-    # ``pinging`` — never affects ``active_number`` or ``is_active``.
+    # (``{"number", "at", "session_pct", "week_pct"}``) if some `cswap auto`
+    # has it past `threshold` right now, else ``None``. Display-only, same
+    # as ``pinging`` — never affects ``active_number`` or ``is_active``.
     hot_probe: dict | None = None
 
 
