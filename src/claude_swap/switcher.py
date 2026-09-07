@@ -1772,6 +1772,7 @@ class ClaudeAccountSwitcher:
             accounts=tuple(accounts),
             taken_at=self._usage_store.clock(),
             pinging=self._read_pinging_state(),
+            hot_probe=self._read_hot_probe_state(),
         )
 
     def _read_pinging_state(self) -> dict | None:
@@ -1796,6 +1797,23 @@ class ClaudeAccountSwitcher:
             return None
         pinging = raw.get("pinging")
         return pinging if isinstance(pinging, dict) else None
+
+    def _read_hot_probe_state(self) -> dict | None:
+        """Best-effort read of `autoswitch_state.json`'s "hotProbe" key (the
+        active account's hot-zone probe state some `cswap auto` may have
+        set — see `autoswitch._hot_zone_decide`). Display-only, same
+        failure handling as `_read_pinging_state`.
+        """
+        try:
+            raw = json.loads(
+                (self.backup_dir / AUTOSWITCH_STATE_FILENAME).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        hot_probe = raw.get("hotProbe")
+        return hot_probe if isinstance(hot_probe, dict) else None
 
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file

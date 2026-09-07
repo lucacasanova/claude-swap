@@ -170,6 +170,7 @@ def account_card_text(
     now: float | None = None,
     palette: Palette = Palette.DARK,
     pinging: dict | None = None,
+    hot_probe: dict | None = None,
 ) -> Text:
     """The full account card: header line + per-window bar rows.
 
@@ -179,9 +180,18 @@ def account_card_text(
     touches the active credential. "active" always tracks the real live
     credential (``acc.is_active``), completely unaffected by this; the
     account being pinged (``number``) additionally gets a "priming" tag.
+
+    ``hot_probe`` is the raw "hotProbe" entry (``{"number", "at", "pct"}``),
+    when the active account is past `threshold` and `cswap auto` is
+    watching it via isolated `/usage` probes instead of the slow official
+    poll (`autoswitch._hot_zone_decide`) — same additive-tag treatment,
+    also never affects ``is_active``.
     """
     now = now if now is not None else time.time()
     pinging_target = str(pinging["number"]) if pinging and "number" in pinging else None
+    hot_probe_target = (
+        str(hot_probe["number"]) if hot_probe and "number" in hot_probe else None
+    )
 
     text = Text()
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.foreground}")
@@ -195,6 +205,10 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.number == pinging_target:
         text.append("   ◐ priming", style=f"bold {palette.sev_warn}")
+    if acc.number == hot_probe_target:
+        pct = hot_probe.get("pct") if isinstance(hot_probe, dict) else None
+        label = f"   ◑ hot-zone {pct:.0f}%" if isinstance(pct, (int, float)) else "   ◑ hot-zone"
+        text.append(label, style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
@@ -355,6 +369,7 @@ class AccountsPanel(Static):
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,
                         palette=palette, pinging=snap.pinging,
+                        hot_probe=snap.hot_probe,
                     )
                 )
             elif self._show_minis:
@@ -382,37 +397,56 @@ class AccountCard(Static):
         *,
         threshold: float | None = None,
         pinging: dict | None = None,
+        hot_probe: dict | None = None,
     ) -> None:
         super().__init__()
         self._acc = acc
         self._threshold = threshold
         self._pinging = pinging
+        self._hot_probe = hot_probe
 
-    def set_account(self, acc: AccountSnapshot, pinging: dict | None = None) -> None:
+    def set_account(
+        self,
+        acc: AccountSnapshot,
+        pinging: dict | None = None,
+        hot_probe: dict | None = None,
+    ) -> None:
         self._acc = acc
         self._pinging = pinging
+        self._hot_probe = hot_probe
         self.refresh(layout=True)
 
     def render(self) -> Text:
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
-            pinging=self._pinging,
+            pinging=self._pinging, hot_probe=self._hot_probe,
         )
 
 
 class AccountItem(ListItem):
     """ListView row wrapping an :class:`AccountCard`; remembers its slot."""
 
-    def __init__(self, acc: AccountSnapshot, *, pinging: dict | None = None) -> None:
-        super().__init__(AccountCard(acc, pinging=pinging))
+    def __init__(
+        self,
+        acc: AccountSnapshot,
+        *,
+        pinging: dict | None = None,
+        hot_probe: dict | None = None,
+    ) -> None:
+        super().__init__(AccountCard(acc, pinging=pinging, hot_probe=hot_probe))
         self.number = acc.number
         self.email = acc.email
 
-    def set_account(self, acc: AccountSnapshot, pinging: dict | None = None) -> None:
+    def set_account(
+        self,
+        acc: AccountSnapshot,
+        pinging: dict | None = None,
+        hot_probe: dict | None = None,
+    ) -> None:
         self.number = acc.number
         self.email = acc.email
-        self.query_one(AccountCard).set_account(acc, pinging)
+        self.query_one(AccountCard).set_account(acc, pinging, hot_probe)
 
 
 class MenuItem(ListItem):

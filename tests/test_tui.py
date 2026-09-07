@@ -369,6 +369,29 @@ class TestFormatting:
         assert "● active" in no_ping
         assert "priming" not in no_ping
 
+    def test_hot_probe_badge_tags_the_active_account_with_its_pct(self):
+        # Hot-zone only ever targets the ACTIVE account — "active" stays
+        # ground truth, and it additionally gets a "hot-zone" tag carrying
+        # the last probed pct.
+        from claude_swap.tui.widgets import account_card_text
+
+        hot_probe = {"number": "1", "at": 0.0, "pct": 96.0}
+
+        watched = account_card_text(
+            make_account(1, active=True), 80, hot_probe=hot_probe
+        ).plain
+        assert "● active" in watched
+        assert "◑ hot-zone 96%" in watched
+
+        other = account_card_text(
+            make_account(2, active=False), 80, hot_probe=hot_probe
+        ).plain
+        assert "hot-zone" not in other
+
+        # No hot-zone probe active: no tag at all.
+        no_probe = account_card_text(make_account(1, active=True), 80).plain
+        assert "hot-zone" not in no_probe
+
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
         from claude_swap.tui.widgets import account_card_text
