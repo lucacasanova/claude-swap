@@ -2,8 +2,10 @@
 
 ``bar_cells``/``usage_bar`` are custom renderers rather than Textual's
 ``ProgressBar`` because the design needs three things the stock widget
-doesn't do: a severity color ramp, an optional threshold tick mark (the
-auto-switch trigger line), and stale-measurement dimming.
+doesn't do: a severity color ramp, an optional threshold tick mark (where
+auto-switch stops trusting the slow official poll and starts closely
+watching via `/usage` — the actual switch only lands at 100%, past the
+right edge), and stale-measurement dimming.
 """
 
 from __future__ import annotations
