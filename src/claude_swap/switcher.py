@@ -172,6 +172,17 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
 # a racing writer's newer valid lineage — freshened, which is the opposite of
 # what this demotion denies. An UNREADABLE store is neither: the CAS could not
 # be evaluated at all, so the slot may still hold the spent generation.
+# How old a display-only `autoswitch_state.json` entry (`pinging`,
+# `hotProbe`) can be before it's treated as orphaned rather than current.
+# Both are written by a *running* engine on a cadence far tighter than
+# these (a ping is a single blocking call bounded by
+# `session._WARM_PING_TIMEOUT`; a hot-zone probe re-fires at worst every
+# `poll_policy.HOT_TIER_1_S`) — generous margins over each, so a still
+# -present entry this old means the engine that wrote it stopped ticking,
+# not that it's merely between updates.
+_PINGING_MAX_AGE_S = 90.0
+_HOT_PROBE_MAX_AGE_S = 120.0
+
 _DEMOTING_STASH_REASONS = (
     "consume-gate-persist-failed",
     "consume-gate-persist-lock-failed",
@@ -1775,12 +1786,11 @@ class ClaudeAccountSwitcher:
             hot_probe=self._read_hot_probe_state(),
         )
 
-    def _read_pinging_state(self) -> dict | None:
-        """Best-effort read of `autoswitch_state.json`'s "pinging" key (a
-        `settings.warm_on_reset` isolated priming ping some `cswap auto` may
-        be mid-touch on right now). Display-only, so any read failure —
-        including no engine ever having run — is silently "nothing to
-        show", never an error.
+    def _read_autoswitch_state(self) -> dict:
+        """Best-effort raw read of `autoswitch_state.json`. Any read failure
+        — including no engine ever having run — is silently "nothing to
+        show", never an error. Shared by every display-only reader below so
+        each one isn't re-reading (and re-parsing) the same small file.
 
         ``AUTOSWITCH_STATE_FILENAME`` (also `autoswitch.STATE_FILENAME`)
         lives in ``paths.py``, not ``autoswitch`` itself: ``autoswitch``
@@ -1792,28 +1802,54 @@ class ClaudeAccountSwitcher:
                 (self.backup_dir / AUTOSWITCH_STATE_FILENAME).read_text(encoding="utf-8")
             )
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _read_pinging_state(self) -> dict | None:
+        """Best-effort read of `autoswitch_state.json`'s "pinging" key (a
+        `settings.warm_on_reset` isolated priming ping some `cswap auto` may
+        be mid-touch on right now). Display-only.
+
+        Dropped once older than `_DISPLAY_STATE_MAX_AGE_S`: the engine
+        clears this itself in a `finally` right after the ping, so a still
+        -present entry that old means the engine that wrote it is no longer
+        running (killed mid-call, or the process just stopped) — showing it
+        forever would tag an account "priming" for a touch that will never
+        actually land.
+        """
+        pinging = self._read_autoswitch_state().get("pinging")
+        if not isinstance(pinging, dict):
             return None
-        if not isinstance(raw, dict):
+        at = pinging.get("since")
+        if not isinstance(at, (int, float)):
             return None
-        pinging = raw.get("pinging")
-        return pinging if isinstance(pinging, dict) else None
+        if self._usage_store.clock() - at > _PINGING_MAX_AGE_S:
+            return None
+        return pinging
 
     def _read_hot_probe_state(self) -> dict | None:
         """Best-effort read of `autoswitch_state.json`'s "hotProbe" key (the
         active account's hot-zone probe state some `cswap auto` may have
-        set — see `autoswitch._hot_zone_decide`). Display-only, same
-        failure handling as `_read_pinging_state`.
+        set — see `autoswitch._hot_zone_decide`). Display-only.
+
+        Dropped once older than `_DISPLAY_STATE_MAX_AGE_S`: a *running*
+        engine re-probes (or self-heals and clears this) at worst every
+        `poll_policy.HOT_TIER_1_S` — a still-present entry well past that
+        means the engine that wrote it has stopped ticking (measured
+        directly: an orphaned entry from a `cswap auto` that was closed
+        mid-hot-zone kept tagging the account "hot-zone 100%" — a number
+        frozen from whenever that engine last ran — indefinitely, on a
+        screen with no engine of its own to notice and correct it).
         """
-        try:
-            raw = json.loads(
-                (self.backup_dir / AUTOSWITCH_STATE_FILENAME).read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        hot_probe = self._read_autoswitch_state().get("hotProbe")
+        if not isinstance(hot_probe, dict):
             return None
-        if not isinstance(raw, dict):
+        at = hot_probe.get("at")
+        if not isinstance(at, (int, float)):
             return None
-        hot_probe = raw.get("hotProbe")
-        return hot_probe if isinstance(hot_probe, dict) else None
+        if self._usage_store.clock() - at > _HOT_PROBE_MAX_AGE_S:
+            return None
+        return hot_probe
 
     def usage_fetch_stamps(self) -> dict[str, float | None]:
         """Per-slot ``fetchedAt`` snapshot from the usage store — a pure file
