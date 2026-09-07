@@ -6989,6 +6989,33 @@ class TestWarmOnReset:
         # same reset again and retries the ping.
         assert h.state()["fiveHourSeen"]["2"] is True
 
+    def test_still_capped_by_weekly_window_is_never_pinged(
+        self, temp_home, monkeypatch
+    ):
+        """5h resetting doesn't mean the account is usable — a still-100%
+        7d window would reject the ping at the API level. Must not spawn a
+        session/ping for it at all, and the reset stays pending so it's
+        retried once the weekly window actually clears."""
+        h = self._two_account_harness(temp_home)
+        h.tick_with_usage({"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _usage(30, "2030-01-01T00:00:00Z")})  # baseline
+        h.events.clear()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            h.engine._session_manager,
+            "ping_to_warm",
+            lambda identifier: calls.append(identifier) or True,
+        )
+
+        outcome = h.tick_with_usage(
+            {"1": _usage(20, "2030-01-01T00:00:00Z"), "2": _idle(100.0)}
+        )
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == []  # ping_to_warm never reached
+        assert not any(isinstance(e, WarmPingEvent) for e in h.events)
+        # Retried later — the reset stays pending, not dropped.
+        assert h.state()["fiveHourSeen"]["2"] is True
+
     def test_dead_credential_is_quarantined_before_any_ping_is_attempted(
         self, temp_home, monkeypatch
     ):

@@ -2289,6 +2289,11 @@ class AutoSwitchEngine:
         in ``__init__``. The ping is a one-shot action: unlike the old
         switch-based touch, there is no multi-tick hold to persist either
         way, since nothing is ever borrowed from the active session.
+
+        A 5h reset alone doesn't mean the account is usable: its 7-day
+        window can still be ≥100%, which would reject the ping at the API
+        level. The binding-window check below skips those candidates
+        without spawning anything — retried next tick, no wasted request.
         """
         oauth_candidates = [
             n
@@ -2331,6 +2336,13 @@ class AutoSwitchEngine:
             return None
 
         target = reset_candidates[0]
+        if (binding_pct(usage.get(target), self._models) or 0.0) >= 100.0:
+            # 5h just reset but another window (typically 7d) is still
+            # ≥100% — the account is still hard-capped at the API level, so
+            # a ping would just fail and burn a real request for nothing.
+            # Leave the reset pending (`fiveHourSeen` untouched) and retry
+            # next tick once every relevant window is actually clear.
+            return None
         email = self.switcher.account_email(target)
         if self.dry_run:
             self._emit(
