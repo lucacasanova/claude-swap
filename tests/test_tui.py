@@ -369,6 +369,51 @@ class TestFormatting:
         assert "● active" in no_ping
         assert "priming" not in no_ping
 
+    def test_hot_probe_badge_tags_the_active_account_with_its_pct(self):
+        # Hot-zone only ever targets the ACTIVE account — "active" stays
+        # ground truth, and it additionally gets a "hot-zone" tag carrying
+        # the last probed pct.
+        from claude_swap.tui.widgets import account_card_text
+
+        hot_probe = {"number": "1", "at": 0.0, "session_pct": 96.0, "week_pct": 20.0}
+
+        watched = account_card_text(
+            make_account(1, active=True), 80, hot_probe=hot_probe
+        ).plain
+        assert "● active" in watched
+        assert "◑ hot-zone 96%" in watched
+
+        other = account_card_text(
+            make_account(2, active=False), 80, hot_probe=hot_probe
+        ).plain
+        assert "hot-zone" not in other
+
+        # No hot-zone probe active: no tag at all.
+        no_probe = account_card_text(make_account(1, active=True), 80).plain
+        assert "hot-zone" not in no_probe
+
+    def test_hot_probe_pct_overrides_the_stale_5h_7d_bars(self):
+        # The default entry's official reading is 5h=25%/7d=10% (stale by
+        # the time a hot-zone probe fires) — the fresh probe's numbers must
+        # win on the matching bar row, tagged "live", not dimmed as stale.
+        from claude_swap.tui.widgets import account_card_text
+
+        hot_probe = {"number": "1", "at": 0.0, "session_pct": 96.0, "week_pct": 20.0}
+        watched = account_card_text(
+            make_account(1, active=True), 80, hot_probe=hot_probe
+        ).plain
+
+        assert "96%" in watched  # fresh 5h reading, not the stale 25%
+        assert "20%" in watched  # fresh 7d reading, not the stale 10%
+        assert "25%" not in watched
+        assert "10%" not in watched
+        assert watched.count("live") == 2  # one tag per overridden row
+
+        # Without a probe for THIS account, the official numbers stand.
+        untouched = account_card_text(make_account(1, active=True), 80).plain
+        assert "25%" in untouched
+        assert "live" not in untouched
+
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette
         from claude_swap.tui.widgets import account_card_text
@@ -1710,6 +1755,61 @@ class TestAccountsSnapshot:
         assert all(not acc.switchable for acc in snap.accounts)
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
+
+    def _write_autoswitch_state(self, switcher, **fields):
+        from claude_swap.paths import AUTOSWITCH_STATE_FILENAME
+
+        switcher.backup_dir.mkdir(parents=True, exist_ok=True)
+        (switcher.backup_dir / AUTOSWITCH_STATE_FILENAME).write_text(
+            json.dumps(fields), encoding="utf-8"
+        )
+
+    def test_hot_probe_state_survives_within_the_normal_cadence(
+        self, temp_home, mock_claude_config
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        self._write_autoswitch_state(switcher, hotProbe={
+            "number": "1", "at": time.time() - 5,
+            "session_pct": 96.0, "week_pct": 20.0,
+        })
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert snap.hot_probe == {
+            "number": "1", "at": snap.hot_probe["at"],
+            "session_pct": 96.0, "week_pct": 20.0,
+        }
+
+    def test_hot_probe_state_expires_once_the_engine_stops_ticking(
+        self, temp_home, mock_claude_config
+    ):
+        """Measured live: a `cswap auto` closed mid-hot-zone left a 100%
+        reading in the state file that kept tagging the account "hot-zone
+        100%" indefinitely — a number frozen from whenever that engine last
+        ran, on a screen with no engine of its own to notice and correct
+        it. A `cswap auto` still running re-probes (or self-heals and
+        clears this) at worst every ~60s; well past that, it's orphaned."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        self._write_autoswitch_state(switcher, hotProbe={
+            "number": "1", "at": time.time() - 200,
+            "session_pct": 100.0, "week_pct": 54.0,
+        })
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert snap.hot_probe is None
+
+    def test_pinging_state_expires_once_the_engine_stops_ticking(
+        self, temp_home, mock_claude_config
+    ):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        self._write_autoswitch_state(switcher, pinging={
+            "number": "2", "since": time.time() - 200,
+        })
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert snap.pinging is None
 
 
 # ---------------------------------------------------------------------------

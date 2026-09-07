@@ -109,6 +109,13 @@ NO_RESET_FALLBACK_S = 300.0
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
 
+# Consecutive `_hot_zone_decide` probe failures (bootstrap, spawn, timeout,
+# unparseable panel) before giving up on the fast `/usage` channel for this
+# span and falling back to `"proactive"` on the last official reading — a
+# broken probe path must never silently strand the engine past real
+# exhaustion.
+HOT_ZONE_MAX_PROBE_FAILURES = 3
+
 
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
@@ -479,6 +486,48 @@ class WarmPingEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class HotProbeEvent(AutoSwitchEvent):
+    """A hot-zone tight-cadence check: once the active account's binding
+    utilization reaches ``settings.threshold``, real usage is read straight
+    from the CLI's own ``/usage`` panel (`SessionManager.fetch_hot_usage`)
+    through an isolated session profile instead of trusting the official
+    endpoint's slower cadence — see ``_hot_zone_decide``.
+
+    ``status``: ``"ok"`` (``session_pct``/``week_pct`` are the fresh
+    reading) or ``"failed"`` (bootstrap, spawn, timeout, or the panel
+    didn't parse; both ``None``, retried next cycle).
+    """
+
+    kind: ClassVar[str] = "hot-probe"
+    number: str
+    email: str
+    status: str
+    session_pct: float | None = None
+    week_pct: float | None = None
+
+    def _fields(self) -> dict:
+        return {
+            "number": self.number,
+            "email": self.email,
+            "status": self.status,
+            "sessionPct": self.session_pct,
+            "weekPct": self.week_pct,
+        }
+
+    def human(self) -> str:
+        if self.status == "failed":
+            return (
+                f"Account-{self.number} ({self.email}) hot-probe failed, "
+                "will retry (hot-zone)"
+            )
+        return (
+            f"Account-{self.number} ({self.email}) hot-probe: "
+            f"session {pct_label(self.session_pct or 0.0)}% · "
+            f"week {pct_label(self.week_pct or 0.0)}% (hot-zone)"
+        )
+
+
+@dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
@@ -745,6 +794,15 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # Hot-zone (active account past `threshold`, see `_hot_zone_decide`):
+        # a per-tick deadline overriding the normal sleep so the loop wakes
+        # exactly on the next probe's tier cadence (20-60s), and an
+        # in-memory consecutive-failure counter gating the `"proactive"`
+        # safety-net fallback — never persisted, so a restart just resumes
+        # counting from zero rather than carrying a stale trip.
+        self._hot_zone_deadline_ts: float | None = None
+        self._hot_zone_failures = 0
+        self._hot_zone_failures_for: str | None = None
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -968,6 +1026,7 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
+        self._hot_zone_deadline_ts = None
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -1053,6 +1112,7 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
+                self._hot_zone_failures = 0
                 if settings.warm_on_reset:
                     warm_outcome = self._maybe_warm_reset(
                         state, usage, current, quarantined
@@ -1077,8 +1137,26 @@ class AutoSwitchEngine:
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
                 trigger = "consume-first"
+            elif active_headroom <= 0:
+                trigger = "at-limit"
             else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                hot_trigger = self._hot_zone_decide(
+                    state, current, current_email, usage.get(current),
+                    utilization, settings.threshold,
+                )
+                if hot_trigger is None:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="hot-zone",
+                            detail=(
+                                f"{pct_label(utilization)}% >= "
+                                f"{pct_label(settings.threshold)}%; probing "
+                                "closely via /usage, switches at 100%"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
+                trigger = hot_trigger
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -2393,6 +2471,162 @@ class AutoSwitchEngine:
             )
         return TickOutcome.NO_ACTION
 
+    def _hot_zone_decide(
+        self,
+        state: dict,
+        current: str,
+        current_email: str,
+        usage_value: dict | str | None,
+        utilization: float,
+        threshold: float,
+    ) -> str | None:
+        """The active account's binding utilization is at or past
+        ``threshold`` but the *official* endpoint hasn't (yet) reported
+        ``100%`` — rather than switch on that stale-by-up-to-60s reading
+        (today's old behaviour, which routinely overshoots to 94-98% before
+        a poll catches it), read the real number straight from the CLI's
+        own ``/usage`` panel through an isolated session profile
+        (`SessionManager.fetch_hot_usage`).
+
+        The two windows the panel reports are watched on different terms:
+        the 5-hour (session) axis resets in hours, so a burst can blow
+        through what's left of it fast — it's watched tightly from
+        ``threshold`` up (`poll_policy.hot_probe_interval_s`'s 60/30/20s
+        tiers). The 7-day (week) axis is a much slower-moving resource and
+        rarely swings from comfortable to capped within one probe interval,
+        so it only starts its own probing once it individually crosses
+        `poll_policy.WEEK_HOT_ZONE_ENTRY_PCT` (98%), at a single fixed
+        cadence (`poll_policy.WEEK_HOT_PROBE_INTERVAL_S`). One `/usage`
+        call always reports both numbers, so whichever axis is engaged
+        shares the SAME probe and the SAME persisted timestamp — two
+        engaged axes never cost two calls; the shared cadence is just the
+        tighter of the two.
+
+        Returns ``"at-limit"`` once a fresh probe actually reports 100% on
+        either axis (switches this same tick — no further delay),
+        ``"proactive"`` as a safety net after `HOT_ZONE_MAX_PROBE_FAILURES`
+        consecutive probe failures (never strand the engine silently past
+        real exhaustion), or ``None`` to keep waiting — the caller returns
+        ``NO_ACTION`` and `self._hot_zone_deadline_ts` (set here whenever a
+        probe was actually scheduled) makes the loop wake exactly on the
+        next probe's schedule; left ``None`` when neither axis is engaged
+        yet, so the loop falls back to the normal official-endpoint cadence
+        instead of polling for nothing.
+        """
+        if self.dry_run:
+            # Never spawns a real probe (same guarantee `warm_on_reset`
+            # gives dry-run) — and must preview what the real engine would
+            # now do, which is no longer an immediate switch just past
+            # `threshold`.
+            return "at-limit" if utilization >= 100.0 else None
+
+        if self._hot_zone_failures_for != current:
+            # A fresh account (a switch landed, or this is the first hot
+            # zone this process has seen) starts with a clean slate —
+            # inheriting a count from whatever account was active before
+            # would trip the safety net on that account's first-ever
+            # failure instead of its third.
+            self._hot_zone_failures = 0
+            self._hot_zone_failures_for = current
+
+        now = self.clock()
+        hot = state.get("hotProbe")
+        hot = hot if isinstance(hot, dict) and hot.get("number") == current else None
+        official = _window_pcts(usage_value if isinstance(usage_value, dict) else None)
+        last_session = (
+            hot["session_pct"] if hot and isinstance(hot.get("session_pct"), (int, float))
+            else official.get("5h")
+        )
+        last_week = (
+            hot["week_pct"] if hot and isinstance(hot.get("week_pct"), (int, float))
+            else official.get("7d")
+        )
+        last_at = hot.get("at") if hot else None
+
+        def engaged_intervals(session: float | None, week: float | None) -> list[float]:
+            intervals = []
+            if session is not None and session >= threshold:
+                intervals.append(poll_policy.hot_probe_interval_s(session))
+            if week is not None and week >= poll_policy.WEEK_HOT_ZONE_ENTRY_PCT:
+                intervals.append(poll_policy.WEEK_HOT_PROBE_INTERVAL_S)
+            return intervals
+
+        intervals = engaged_intervals(last_session, last_week)
+        if not intervals:
+            # Neither axis individually wants tight probing yet (week
+            # under 98%, session under `threshold`, going by whatever we
+            # last saw) — nothing to probe; let the normal official-poll
+            # cadence keep refreshing both until one of them actually
+            # crosses its own gate.
+            if hot is not None:
+                self._mutate_state(lambda s: s.pop("hotProbe", None))
+            return None
+        interval = min(intervals)
+
+        if isinstance(last_at, (int, float)) and now - last_at < interval:
+            self._hot_zone_deadline_ts = last_at + interval
+            return None
+
+        if self.switcher.live_session_pids_for(current, current_email):
+            # A live manual `cswap run` already owns this slot's isolated
+            # profile — never probe over it; just wait for the next tier
+            # tick like an ordinary not-due read.
+            self._hot_zone_deadline_ts = now + interval
+            return None
+
+        probe = self._session_manager.fetch_hot_usage(current)
+        if probe is None:
+            self._hot_zone_failures += 1
+            self._mutate_state(
+                lambda s: s.__setitem__(
+                    "hotProbe", {
+                        "number": current, "at": now,
+                        "session_pct": last_session, "week_pct": last_week,
+                    }
+                )
+            )
+            self._emit(
+                HotProbeEvent(number=current, email=current_email, status="failed")
+            )
+            if self._hot_zone_failures >= HOT_ZONE_MAX_PROBE_FAILURES:
+                self._hot_zone_failures = 0
+                return "proactive"
+            self._hot_zone_deadline_ts = now + interval
+            return None
+
+        self._hot_zone_failures = 0
+        session_pct = probe["session_pct"]
+        week_pct = probe["week_pct"]
+        hot_pct = max(session_pct, week_pct)
+        self._emit(
+            HotProbeEvent(
+                number=current,
+                email=current_email,
+                status="ok",
+                session_pct=session_pct,
+                week_pct=week_pct,
+            )
+        )
+        next_intervals = engaged_intervals(session_pct, week_pct)
+        if not next_intervals:
+            # A burst subsided or the window rolled over — neither axis is
+            # still in its own hot territory; self-heal back to normal
+            # below-threshold handling next tick rather than keep probing.
+            self._mutate_state(lambda s: s.pop("hotProbe", None))
+            return None
+        self._mutate_state(
+            lambda s: s.__setitem__(
+                "hotProbe", {
+                    "number": current, "at": now,
+                    "session_pct": session_pct, "week_pct": week_pct,
+                }
+            )
+        )
+        if hot_pct >= 100.0:
+            return "at-limit"
+        self._hot_zone_deadline_ts = now + min(next_intervals)
+        return None
+
     # -- helpers --------------------------------------------------------------
 
     def _in_cooldown(self, state: dict) -> bool:
@@ -2532,6 +2766,13 @@ class AutoSwitchEngine:
             # until the user comes back, so crawl. Worst case protection
             # resumes one slow tick after they do.
             return max(interval, NO_RESET_FALLBACK_S)
+        elif outcome is TickOutcome.NO_ACTION and self._hot_zone_deadline_ts is not None:
+            # Hot-zone tiered probing (20-60s) via the isolated `/usage`
+            # channel — not subject to the official endpoint's budget, so
+            # this deliberately bypasses `_respect_poll_plan`'s 60s floor
+            # (that floor protects the *other*, rate-limited channel) and
+            # `interval_seconds` entirely: wake exactly on the next tier.
+            return max(0.0, self._hot_zone_deadline_ts - self.clock())
         # ±10% jitter so multiple machines don't synchronize their API hits.
         return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
 

@@ -602,8 +602,8 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  cswap auto                       # foreground loop, switch at 90%% used
-  cswap auto --threshold 80        # switch earlier
+  cswap auto                       # foreground loop, watches closely from 90%% used, switches at 100%%
+  cswap auto --threshold 80        # start watching earlier
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -634,8 +634,9 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Start closely watching (isolated /usage probes) once the "
+            "active account's binding 5h/7d window reaches this "
+            "utilization; switches at 100%% (50-99.9; default 90)"
         ),
     )
     parser.add_argument(

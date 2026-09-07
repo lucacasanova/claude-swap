@@ -17,10 +17,12 @@ from claude_swap.autoswitch import (
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
     SPENT_HEADROOM_PCT,
+    HOT_ZONE_MAX_PROBE_FAILURES,
     AllExhaustedEvent,
     AutoSwitchEngine,
     ConfigWarningEvent,
     ErrorEvent,
+    HotProbeEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
@@ -172,6 +174,16 @@ class EngineHarness:
         ):
             return self.engine.tick()
 
+    def force_proactive(self, monkeypatch) -> None:
+        """Bypass hot-zone probing so an active account at/past threshold
+        (but under 100%) decides via the old, direct `"proactive"` trigger
+        instead of waiting on `/usage` probes. For tests exercising
+        proactive-specific gates (hysteresis, the below-threshold landing
+        rule, cooldown) that `"at-limit"`'s laxer rules would relax away."""
+        monkeypatch.setattr(
+            self.engine, "_hot_zone_decide", lambda *a, **k: "proactive"
+        )
+
     def active_number(self) -> int | None:
         return self.switcher._get_sequence_data()["activeAccountNumber"]
 
@@ -317,13 +329,15 @@ class TestDecisionTable:
         assert reasons == ["below-threshold"]
 
     def test_over_threshold_switches_to_max_headroom(self, harness):
+        # Active at literal 100% (headroom<=0) still routes straight to
+        # "at-limit" -- hot-zone only gates the [threshold, 100) band.
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(40), "3": _usage(20),
+            "1": _usage(100), "2": _usage(40), "3": _usage(20),
         })
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
-        assert switch.trigger == "proactive"
+        assert switch.trigger == "at-limit"
         assert switch.to_ref == {"number": 3, "email": "c@example.com"}
         assert harness.state()["lastSwitchTo"] == "3"
 
@@ -334,12 +348,15 @@ class TestDecisionTable:
             "no-active-account"
         ]
 
-    def test_hysteresis_margin_blocks_marginal_candidates(self, harness):
+    def test_hysteresis_margin_blocks_marginal_candidates(self, harness, monkeypatch):
         # threshold 90, hysteresis 10 → a candidate must beat the active
         # account's utilization by >= 10 points; 95→86 is only 9 better.
         # Failing the margin is NOT exhaustion: no all-exhausted event, no
         # reset-sleep — the next tick must stay at normal cadence so the
         # at-limit escape isn't missed when the active account tops out.
+        # Forced to "proactive": at-limit has no hysteresis gate at all, so
+        # a real 100% active would take the 86%/88% candidates outright.
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(86), "3": _usage(88),
         })
@@ -352,10 +369,14 @@ class TestDecisionTable:
         delay = harness.engine._next_delay(outcome)
         assert delay <= 1.1 * harness.settings.interval_seconds
 
-    def test_issue_115_strictly_better_candidate_switches(self, harness):
+    def test_issue_115_strictly_better_candidate_switches(self, harness, monkeypatch):
         # Regression for #115: active bound by 5h (99%), candidate bound by
         # 7d (89%). The old absolute bar (<= 80% used) vetoed the candidate;
-        # the relative gate takes it: 89 < 90 and 99 - 89 >= 10.
+        # the relative gate takes it: 89 < 90 and 99 - 89 >= 10. Forced to
+        # "proactive": this relative gate (candidate below threshold AND
+        # beats active by hysteresis) is what's under test, and doesn't
+        # apply to "at-limit".
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 24.0}},
             "2": {"five_hour": {"pct": 3.0}, "seven_day": {"pct": 89.0}},
@@ -366,14 +387,16 @@ class TestDecisionTable:
         assert switch.trigger == "proactive"
         assert harness.active_number() == 2
 
-    def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
+    def test_proactive_never_lands_at_or_over_threshold(self, temp_home, monkeypatch):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
-        # and would re-trigger on the very next tick — blocked.
+        # and would re-trigger on the very next tick — blocked. Forced to
+        # "proactive": this landing rule doesn't apply to "at-limit".
         h = EngineHarness(temp_home, threshold=80.0, hysteresis_pct=5.0)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
         outcome = h.tick_with_usage({"1": _usage(90), "2": _usage(85)})
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
@@ -382,14 +405,16 @@ class TestDecisionTable:
 
     def test_stable_landing_does_not_switch_back(self, temp_home):
         # Cooldown disabled so only the gate itself prevents flapping: after
-        # 99→89 the roles reverse, and the old account (99%) can never beat
-        # the new active (89%) — the move is one-way.
+        # 100→89 the roles reverse, and the old account (now exhausted)
+        # can never beat the new active (89%) — the move is one-way. 100%
+        # (not 99%) so the first switch routes through the unchanged
+        # at-limit path rather than waiting on a hot-zone probe.
         h = EngineHarness(temp_home, cooldown_seconds=0.0)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
         usage = {
-            "1": {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 24.0}},
+            "1": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 24.0}},
             "2": {"five_hour": {"pct": 3.0}, "seven_day": {"pct": 89.0}},
         }
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
@@ -404,7 +429,7 @@ class TestDecisionTable:
         # One candidate at its limit, the other unreadable this tick: usage
         # could recover any moment, so no long reset-sleep.
         outcome = harness.tick_with_usage({
-            "1": _usage(95),
+            "1": _usage(100),
             "2": _usage(100, "2026-07-03T12:00:00Z"),
             "3": None,
         })
@@ -423,7 +448,7 @@ class TestDecisionTable:
         now = harness.clock.now
         reset = "2026-07-05T12:00:00Z"
         outcome = harness.tick_with_entries({
-            "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0),
+            "1": UsageEntry(last_good=_usage(100), fetched_at=now, age_s=0.0),
             "2": UsageEntry(
                 last_good=_usage(100, reset), fetched_at=now - 400, age_s=400.0,
                 consecutive_failures=1, trust_extended=True,
@@ -445,7 +470,12 @@ class TestDecisionTable:
             consecutive_failures=1, trust_extended=True,
         )
         outcome = harness.tick_with_entries({
-            "1": UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0),
+            # A later reset than `reset` -- exhausted-with-a-known-reset too
+            # (so `_earliest_recovery` doesn't treat it as unprovable), but
+            # not the earliest one, so the expected answer is unchanged.
+            "1": UsageEntry(
+                last_good=_usage(100, "2026-08-01T00:00:00Z"), fetched_at=now, age_s=0.0
+            ),
             "2": stale_exhausted,
             "3": stale_exhausted,
         })
@@ -455,7 +485,8 @@ class TestDecisionTable:
         )
         assert exhausted.earliest_reset_at == reset
 
-    def test_cooldown_suppresses_proactive(self, harness):
+    def test_cooldown_suppresses_proactive(self, harness, monkeypatch):
+        harness.force_proactive(monkeypatch)
         harness.engine._mutate_state(
             lambda s: s.update(lastSwitchAt=harness.clock() - 10)
         )
@@ -485,7 +516,7 @@ class TestDecisionTable:
         )
         harness.clock.advance(400)  # past the 300s default cooldown
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(10), "3": _usage(50),
+            "1": _usage(100), "2": _usage(10), "3": _usage(50),
         })
         assert outcome is TickOutcome.SWITCHED
 
@@ -509,7 +540,7 @@ class TestDecisionTable:
 
     def test_all_candidates_unknown_is_no_comparison(self, harness):
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": None, "3": None,
+            "1": _usage(100), "2": None, "3": None,
         })
         assert outcome is TickOutcome.BLOCKED
         assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
@@ -518,13 +549,17 @@ class TestDecisionTable:
 
     def test_tie_resolves_to_earliest_slot(self, harness):
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(30), "3": _usage(30),
+            "1": _usage(100), "2": _usage(30), "3": _usage(30),
         })
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
 
-    def test_candidate_not_better_than_active_is_skipped(self, harness):
+    def test_candidate_not_better_than_active_is_skipped(self, harness, monkeypatch):
         # Active 91% used (9 headroom); candidates worse or equal → exhausted.
+        # Forced to "proactive": at-limit is an escape (any headroom beats a
+        # blocked account), so a literal-100% active would take one of these
+        # worse candidates instead of correctly skipping them.
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(91), "2": _usage(95), "3": _usage(99),
         })
@@ -1715,7 +1750,7 @@ class TestApiKeyAccounts:
         h.seed(2, "key@token.local")
         h.make_live("a@example.com", 1)
         self._mark_api_key(h, 2)
-        outcome = h.tick_with_usage({"1": _usage(95), "2": "api key"})
+        outcome = h.tick_with_usage({"1": _usage(100), "2": "api key"})
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
 
@@ -1728,7 +1763,7 @@ class TestApiKeyAccounts:
         self._mark_api_key(h, 2)
         # A qualifying OAuth candidate wins over the API key...
         outcome = h.tick_with_usage({
-            "1": _usage(95), "2": "api key", "3": _usage(10),
+            "1": _usage(100), "2": "api key", "3": _usage(10),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
@@ -1779,7 +1814,7 @@ class TestFreshening:
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(rotated, None),
         ) as mock_refresh:
-            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
 
         assert outcome is TickOutcome.SWITCHED
         mock_refresh.assert_called_once()
@@ -1797,7 +1832,7 @@ class TestFreshening:
         with patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
-            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
         assert outcome is TickOutcome.SWITCHED
         mock_refresh.assert_not_called()
 
@@ -1812,7 +1847,7 @@ class TestFreshening:
             return_value=oauth.RefreshOutcome(None, "invalid_grant"),
         ):
             outcome = h.tick_with_usage({
-                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+                "1": _usage(100), "2": _usage(10), "3": _usage(20),
             })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3  # next candidate after 2 was quarantined
@@ -1829,7 +1864,7 @@ class TestFreshening:
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
             return_value=oauth.RefreshOutcome(None, "transient"),
         ):
-            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
         assert outcome is TickOutcome.ERROR
         assert h.active_number() == 1
         assert not h.state().get("quarantine")
@@ -1847,7 +1882,7 @@ class TestFreshening:
         ), patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
-            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
         assert outcome is TickOutcome.BLOCKED
         mock_refresh.assert_not_called()
         assert h.active_number() == 1
@@ -1862,7 +1897,7 @@ class TestFreshening:
         ), patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
-            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
         assert outcome is TickOutcome.BLOCKED
         mock_refresh.assert_not_called()
         assert h.active_number() == 1
@@ -1873,7 +1908,7 @@ class TestQuarantineLifecycle:
         harness.engine._quarantine("2", "b@example.com", "invalid_grant")
         harness.events.clear()
         fresh_engine = harness._make_engine()
-        usage = {"1": _usage(95), "2": _usage(0), "3": _usage(50)}
+        usage = {"1": _usage(100), "2": _usage(0), "3": _usage(50)}
         with patch.object(
             harness.switcher,
             "usage_entries_by_account",
@@ -1899,7 +1934,7 @@ class TestQuarantineLifecycle:
         )
         harness.events.clear()
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(0), "3": _usage(50),
+            "1": _usage(100), "2": _usage(0), "3": _usage(50),
         })
         assert any(isinstance(e, UnquarantineEvent) for e in harness.events)
         assert outcome is TickOutcome.SWITCHED
@@ -1930,7 +1965,7 @@ class TestDryRunAndNoOp:
         h.engine = h._make_engine(dry_run=True)
         live_before = (temp_home / ".claude" / ".credentials.json").read_text()
 
-        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
 
         assert outcome is TickOutcome.SWITCHED
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
@@ -1953,7 +1988,7 @@ class TestDryRunAndNoOp:
         with patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
-            outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
 
         assert outcome is TickOutcome.SWITCHED  # reported the would-switch
         mock_refresh.assert_not_called()
@@ -1975,7 +2010,7 @@ class TestDryRunAndNoOp:
         h.engine = h._make_engine(dry_run=True)
         state_before = h.state()
 
-        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
 
         assert not any(isinstance(e, UnquarantineEvent) for e in h.events)
         assert h.state() == state_before  # state file untouched
@@ -1989,7 +2024,7 @@ class TestDryRunAndNoOp:
             return_value={"switched": False, "reason": "already-active"},
         ):
             outcome = harness.tick_with_usage({
-                "1": _usage(95), "2": _usage(10), "3": _usage(50),
+                "1": _usage(100), "2": _usage(10), "3": _usage(50),
             })
         assert outcome is TickOutcome.NO_ACTION
         assert "lastSwitchAt" not in harness.state()
@@ -2006,7 +2041,7 @@ class TestEventsShape:
             assert payload["ts"].endswith("Z")
 
     def test_switch_event_refs_match_account_ref_shape(self, harness):
-        harness.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(50)})
+        harness.tick_with_usage({"1": _usage(100), "2": _usage(10), "3": _usage(50)})
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         payload = switch.to_json()
         assert payload["from"] == {"number": 1, "email": "a@example.com"}
@@ -2214,13 +2249,15 @@ class TestLoopObeysThePollPlan:
 class TestSessionThreshold:
     """apply_threshold(): the TUI's session-only, mid-run override."""
 
-    def test_apply_threshold_retargets_trigger_and_poll_pin(self, harness):
+    def test_apply_threshold_retargets_trigger_and_poll_pin(self, harness, monkeypatch):
         harness.engine.apply_threshold(72.0)
         assert harness.engine.settings.threshold == 72.0
         # Poll-cadence planning follows the new value immediately.
         assert harness.switcher._poll_inputs_override == (72.0, ())
-        # And the very next tick decides with it: 80% ≥ 72 switches, where
-        # the constructed 90 would not have.
+        # And the very next tick decides with it: 80% ≥ 72 enters hot-zone,
+        # where the constructed 90 would not have -- forced past the probe
+        # (irrelevant here) to confirm the retargeted threshold itself.
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(80), "2": _usage(10), "3": _usage(10),
         })
@@ -2395,7 +2432,7 @@ class TestTokenIdentity:
             side_effect=refresh,
         ):
             outcome = harness.tick_with_usage({
-                "1": _usage(95), "2": _usage(10), "3": _usage(80),
+                "1": _usage(100), "2": _usage(10), "3": _usage(80),
             })
         # Account 2 had the most headroom but is conflicted → quarantined,
         # and the switch landed elsewhere.
@@ -2439,7 +2476,7 @@ class TestTokenIdentity:
             side_effect=refresh,
         ):
             outcome = harness.tick_with_usage({
-                "1": _usage(95), "2": _usage(10), "3": _usage(80),
+                "1": _usage(100), "2": _usage(10), "3": _usage(80),
             })
         q = harness.state().get("quarantine", {})
         assert q.get("2", {}).get("reason") == "invalid_grant"
@@ -2639,12 +2676,18 @@ class TestModelAwareSwitch:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
-    def test_dual_exhausted_candidate_recovers_at_its_later_reset(self, temp_home):
+    def test_dual_exhausted_candidate_recovers_at_its_later_reset(
+        self, temp_home, monkeypatch
+    ):
         # #2 is blocked on both its 5h (resets 12:00) and Fable (15:00): it's
         # only usable again at the LATER one. #3 recovers later still (20:00),
         # so the all-exhausted wake is #2's Fable reset — which the old
         # earliest-of-any-window scan (12:00) would have jumped early for.
+        # Forced to "proactive" (active stays 95%, not exhausted itself) so
+        # this stays about the CANDIDATES' recovery math, not active's own
+        # hot-zone probing.
         h = self._seed(temp_home, model="Fable")
+        h.force_proactive(monkeypatch)
         fable_reset = "2026-07-05T15:00:00Z"
         outcome = h.tick_with_usage({
             "1": _model_usage(95, 10),
@@ -2664,12 +2707,16 @@ class TestModelAwareSwitch:
         exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
         assert exhausted.earliest_reset_at == fable_reset
 
-    def test_unknown_recovery_falls_back_instead_of_oversleeping(self, temp_home):
+    def test_unknown_recovery_falls_back_instead_of_oversleeping(
+        self, temp_home, monkeypatch
+    ):
         # #2 is exhausted with NO reset timestamp — it could recover any
         # moment. Sleeping toward #3's known 20:00 reset would suppress
         # checks for hours, so the wake time must be unprovable (bounded
-        # blocked-cadence fallback instead of a reset sleep).
+        # blocked-cadence fallback instead of a reset sleep). Forced to
+        # "proactive" so active's own (healthy) 95% doesn't hot-zone-wait.
         h = self._seed(temp_home, model="Fable")
+        h.force_proactive(monkeypatch)
         outcome = h.tick_with_usage({
             "1": _model_usage(95, 10),
             "2": {
@@ -2688,10 +2735,13 @@ class TestModelAwareSwitch:
         assert h.engine._sleep_until_ts is None
         assert h.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
 
-    def test_scoped_only_exhaustion_drives_the_wake_time(self, temp_home):
+    def test_scoped_only_exhaustion_drives_the_wake_time(self, temp_home, monkeypatch):
         # Candidates blocked ONLY by Fable: the wake must come from the scoped
         # reset — the 5h/7d-only scan would find no ≥100% window at all.
+        # Forced to "proactive" so active's own (healthy) 95% doesn't
+        # hot-zone-wait.
         h = self._seed(temp_home, model="Fable")
+        h.force_proactive(monkeypatch)
         fable_reset = "2026-07-06T09:00:00Z"
         blocked = {
             "five_hour": {"pct": 3.0, "resets_at": "2026-07-05T12:00:00Z"},
@@ -2822,7 +2872,7 @@ class TestConsumeFirstStrategy:
         # Active over threshold -> must move. #2 has LESS headroom but resets
         # sooner; #3 has more headroom but resets latest. consume-first -> #2.
         outcome = h.tick_with_usage({
-            "1": _usage7(95, 20, _R_LATER),
+            "1": _usage7(100, 20, _R_LATER),
             "2": _usage7(50, 40, _R_SOON),
             "3": _usage7(10, 10, _R_LATEST),
         })
@@ -3385,9 +3435,12 @@ class TestEveryAccountAboveThreshold:
             .replace("+00:00", "Z")
         )
 
-    def test_moves_to_the_soonest_recovering_account(self, harness):
+    def test_moves_to_the_soonest_recovering_account(self, harness, monkeypatch):
         """The measured shape: active 99, peers 100 and 95. Account 3 is the
-        only one both viable and soon, and it is where we must land."""
+        only one both viable and soon, and it is where we must land. Forced
+        past hot-zone (a single-tick 99% now defers instead of acting) so
+        this stays a pin on the recovery-ranking mechanics themselves."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._at(harness, 3600 * 2)),   # active, back in 2h
             "2": _usage(100, self._at(harness, 600)),       # at limit — never a target
@@ -3396,10 +3449,11 @@ class TestEveryAccountAboveThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
-    def test_soonest_wins_over_most_headroom(self, harness):
+    def test_soonest_wins_over_most_headroom(self, harness, monkeypatch):
         """Ranking flips in this state: the usual "most headroom" pick is the
         wrong one when every account is nearly spent — what matters is which
         one can work again first."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._at(harness, 3600)),
             "2": _usage(91, self._at(harness, 3600 * 3)),  # most headroom, latest back
@@ -3408,8 +3462,9 @@ class TestEveryAccountAboveThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
-    def test_a_single_healthy_peer_still_wins_normally(self, harness):
+    def test_a_single_healthy_peer_still_wins_normally(self, harness, monkeypatch):
         """The escape must not fire while an ordinary target exists."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._at(harness, 3600)),
             "2": _usage(95, self._at(harness, 60)),   # soonest, but still spent
@@ -3437,9 +3492,10 @@ class TestEveryAccountAboveThreshold:
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
 
-    def test_unknown_reset_sorts_last_not_first(self, harness):
+    def test_unknown_reset_sorts_last_not_first(self, harness, monkeypatch):
         """A candidate whose reset nobody knows must not masquerade as
         'back immediately' and beat a measured, genuinely imminent one."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._at(harness, 3600)),
             "2": _usage(95),                          # no resets_at at all
@@ -3448,10 +3504,11 @@ class TestEveryAccountAboveThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
-    def test_does_not_flap_between_two_near_equal_accounts(self, harness):
+    def test_does_not_flap_between_two_near_equal_accounts(self, harness, monkeypatch):
         """The escape relaxes the percentage-point hysteresis, so it owes the
         anti-flap guarantee on its own axis: two accounts whose windows roll
         over at nearly the same time must not trade places forever."""
+        harness.force_proactive(monkeypatch)
         a = self._at(harness, 600)
         b = self._at(harness, 660)  # 60s apart — inside RECOVERY_HYSTERESIS_S
         first = harness.tick_with_usage({
@@ -3460,8 +3517,9 @@ class TestEveryAccountAboveThreshold:
         assert first is TickOutcome.BLOCKED, "60s sooner is not worth a switch"
         assert harness.active_number() == 1
 
-    def test_a_meaningfully_sooner_account_still_wins(self, harness):
+    def test_a_meaningfully_sooner_account_still_wins(self, harness, monkeypatch):
         """The margin must not be so wide it swallows the real case."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._at(harness, 3600)),
             "2": _usage(98, self._at(harness, 600)),  # an hour sooner
@@ -3470,7 +3528,7 @@ class TestEveryAccountAboveThreshold:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
 
-    def test_consume_first_gets_the_same_anti_flap_guard(self, temp_home):
+    def test_consume_first_gets_the_same_anti_flap_guard(self, temp_home, monkeypatch):
         """The escape must not depend on which strategy is configured.
 
         `if consume_first:` used to catch first, so a consume-first user
@@ -3482,6 +3540,7 @@ class TestEveryAccountAboveThreshold:
         h = EngineHarness(temp_home, strategy="consume-first")
         h.seed(1, "a@example.com"); h.seed(2, "b@example.com")
         h.seed(3, "c@example.com"); h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
         a = self._at(h, 600)
         b = self._at(h, 660)  # 60s apart — inside RECOVERY_HYSTERESIS_S
         outcome = h.tick_with_usage({
@@ -3571,9 +3630,10 @@ class TestRecoveryHorizon:
             .replace("+00:00", "Z")
         )
 
-    def test_a_minutes_away_reset_still_wins(self, harness):
+    def test_a_minutes_away_reset_still_wins(self, harness, monkeypatch):
         """The #202 design case is unchanged: an 8-minute wait is worth 9
         points of headroom."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(91, self._at(harness, 7200)),   # active, 9 left, back in 2h
             "2": _usage(94, self._at(harness, 1800)),
@@ -3595,7 +3655,7 @@ class TestRecoveryHorizon:
         )
 
     def test_an_unreadable_peer_does_not_veto_the_spent_check(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """The spent check ranks the CANDIDATES, not every account in `usage`.
 
@@ -3612,6 +3672,7 @@ class TestRecoveryHorizon:
                      (3, "c@example.com"), (4, "d@example.com")):
             h.seed(n, e)
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         outcome = h.tick_with_usage({
             "1": _usage(99, self._at(h, 109 * 3600)),  # active, resets LAST
@@ -3626,7 +3687,7 @@ class TestRecoveryHorizon:
         )
 
     def test_an_unreadable_peer_does_not_forge_headroom_for_the_spent_check(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """Counting an unreadable candidate's headroom as 100.0 instead of
         excluding it turns the all-spent gate off for the whole fleet.
@@ -3656,6 +3717,7 @@ class TestRecoveryHorizon:
                      (3, "c@example.com")):
             h.seed(n, e)
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         outcome = h.tick_with_usage({
             "1": _usage(97.5, self._at(h, 500 * 3600)),  # active, 2.5 pts
@@ -3671,7 +3733,7 @@ class TestRecoveryHorizon:
         assert h.active_number() == 2
 
     def test_a_weekly_bound_active_does_not_refuse_a_peer_back_in_minutes(
-        self, harness
+        self, harness, monkeypatch
     ):
         """The horizon is asked PER CANDIDATE, not once on the active.
 
@@ -3682,6 +3744,7 @@ class TestRecoveryHorizon:
         window, so the active's reset and the candidates' always moved
         together.
         """
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             # active: 5h fine, WEEKLY at 96% resetting 109h out — days.
             "1": _usage7(10, 96, self._at(harness, 109 * 3600)),
@@ -3713,9 +3776,12 @@ class TestRecoveryHorizon:
         )
         assert outcome is not TickOutcome.SWITCHED
 
-    def test_a_peer_with_real_headroom_still_wins_past_the_horizon(self, harness):
+    def test_a_peer_with_real_headroom_still_wins_past_the_horizon(
+        self, harness, monkeypatch
+    ):
         """Falling back to headroom is not "never move": a peer holding
         materially more quota is still the right landing, days-away or not."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(97, self._at(harness, 50 * 3600)),   # active, 3 left
             "2": _usage(91, self._at(harness, 109 * 3600)),  # 9 left
@@ -3741,7 +3807,9 @@ class TestTheHorizonDoesNotDiscardWhatItAlreadyKnows:
             .replace("+00:00", "Z")
         )
 
-    def test_equal_headroom_past_the_horizon_takes_the_sooner_reset(self, harness):
+    def test_equal_headroom_past_the_horizon_takes_the_sooner_reset(
+        self, harness, monkeypatch
+    ):
         """The tier-1 key hard-coded ``0.0`` where ``recovery_ts`` belongs.
 
         Two peers with IDENTICAL headroom, both past the horizon, one returning
@@ -3755,6 +3823,7 @@ class TestTheHorizonDoesNotDiscardWhatItAlreadyKnows:
         than list order at zero cost. Headroom still outranks it — the tier
         byte separates the two axes, and `-h` still comes first within tier 1.
         """
+        harness.force_proactive(monkeypatch)
         out = harness.tick_with_usage({
             "1": _usage(96, self._at(harness, 300 * 3600)),   # active, 4 pts
             "2": _usage(92, self._at(harness, 500 * 3600)),   # 8 pts, LAST
@@ -3806,7 +3875,9 @@ class TestTheHorizonDoesNotDiscardWhatItAlreadyKnows:
         )
         assert out is not TickOutcome.SWITCHED or harness.active_number() == 2
 
-    def test_an_unchoosable_peer_does_not_veto_the_reset_ranking(self, harness):
+    def test_an_unchoosable_peer_does_not_veto_the_reset_ranking(
+        self, harness, monkeypatch
+    ):
         """``best_candidate_headroom`` counted a candidate the ranking cannot pick.
 
         The spent check asks "is anything worth having?" of the BEST candidate.
@@ -3828,6 +3899,7 @@ class TestTheHorizonDoesNotDiscardWhatItAlreadyKnows:
         shape for an UNREADABLE peer; a readable one 0.05 points over the line
         does the same damage.
         """
+        harness.force_proactive(monkeypatch)
         out = harness.tick_with_usage({
             "1": _usage(97.0, self._at(harness, 200 * 3600)),   # active, 3 pts
             "2": _usage(97.0, self._at(harness, 10 * 3600)),    # 3 pts, sooner
@@ -3892,7 +3964,7 @@ class TestHorizonAxisDoesNotFlap:
         return cache[key]
 
     def test_a_fixed_reset_crosses_into_the_horizon_as_the_clock_advances(
-        self, harness
+        self, harness, monkeypatch
     ):
         """`_days_out` must return a FIXED absolute instant, not
         "N hours from whenever this is called."
@@ -3907,6 +3979,7 @@ class TestHorizonAxisDoesNotFlap:
         call would keep reporting the peer's reset as exactly 5h out
         forever, and the horizon would never be crossed.
         """
+        harness.force_proactive(monkeypatch)
         outcome1 = harness.tick_with_usage({
             "1": _usage(95, self._days_out(harness, 400)),   # active, far reset
             "2": _usage(94, self._days_out(harness, 5)),     # peer, 5h out
@@ -3951,7 +4024,7 @@ class TestHorizonAxisDoesNotFlap:
         assert harness.active_number() == 1
         assert outcome is not TickOutcome.SWITCHED
 
-    def test_a_pair_straddling_the_horizon_does_not_ping_pong(self, harness):
+    def test_a_pair_straddling_the_horizon_does_not_ping_pong(self, harness, monkeypatch):
         """Each guard is one-way on ITS OWN axis — but the axis itself flips.
 
         ``_recovery_is_useful`` reads the ACTIVE account's headroom and the
@@ -3969,6 +4042,7 @@ class TestHorizonAxisDoesNotFlap:
         every cooldown until the sooner reset actually lands. Every other test
         in this class ticks ONCE, which is why the pair went unseen.
         """
+        harness.force_proactive(monkeypatch)
         r_far = self._days_out(harness, 109)
         r_near = self._days_out(harness, 3.5)
         seen = []
@@ -4019,7 +4093,7 @@ class TestHorizonAxisDoesNotFlap:
         assert outcome is not TickOutcome.SWITCHED
 
     def test_the_tier_byte_puts_a_returning_peer_ahead_of_a_distant_one(
-        self, harness
+        self, harness, monkeypatch
     ):
         """`(0, ...)` before `(1, ...)` — the tier prefix itself, not its tail.
 
@@ -4031,6 +4105,7 @@ class TestHorizonAxisDoesNotFlap:
         whatever its headroom: acct 2 is nearly spent but works again in an
         hour; acct 3 has nine points that never return this session.
         """
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._days_out(harness, 300)),    # active, 1 left
             "2": _usage(98.5, self._days_out(harness, 1)),    # 1.5 left, back in 1h
@@ -4042,7 +4117,7 @@ class TestHorizonAxisDoesNotFlap:
             "returns over a peer that works again in an hour"
         )
 
-    def test_the_fallback_breaks_a_reset_tie_by_headroom(self, harness):
+    def test_the_fallback_breaks_a_reset_tie_by_headroom(self, harness, monkeypatch):
         """The fallback key's THIRD slot: `(0, recovery_ts, -h)`.
 
         `test_the_fallback_ranks_by_reset_not_by_headroom` pins the second
@@ -4051,6 +4126,7 @@ class TestHorizonAxisDoesNotFlap:
         through the fallback, which requires the active to sit exactly at
         SPENT_HEADROOM_PCT so neither peer meets the ratio.
         """
+        harness.force_proactive(monkeypatch)
         same = self._days_out(harness, 10)
         outcome = harness.tick_with_usage({
             "1": _usage(97, self._days_out(harness, 300)),   # active, 3.0 left
@@ -4063,7 +4139,9 @@ class TestHorizonAxisDoesNotFlap:
             "fallback took the smaller headroom"
         )
 
-    def test_past_the_horizon_headroom_decides_before_the_reset(self, harness):
+    def test_past_the_horizon_headroom_decides_before_the_reset(
+        self, harness, monkeypatch
+    ):
         """Tier 1 is `(1, -h, recovery_ts)` — headroom leads, reset breaks ties.
 
         Past the horizon the reset is days out either way, so it cannot be the
@@ -4081,6 +4159,7 @@ class TestHorizonAxisDoesNotFlap:
         headroom for a reset 10 hours sooner, on a pair that both return
         within a day.
         """
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._days_out(harness, 20)),     # active, 1 left
             "2": _usage(98, self._days_out(harness, 10)),     # 2 left, sooner
@@ -4244,7 +4323,7 @@ class TestHorizonAxisDoesNotFlap:
             "eight ticks, so it does not settle at all"
         )
 
-    def test_a_proactive_move_does_not_lock_out_the_next_one(self, harness):
+    def test_a_proactive_move_does_not_lock_out_the_next_one(self, harness, monkeypatch):
         """The no-return filter has no release condition on a 2-account fleet.
 
         `lastSwitchFrom` is written only by a SUCCESSFUL switch, and on two
@@ -4262,6 +4341,7 @@ class TestHorizonAxisDoesNotFlap:
         proves nothing about whether a move can happen, and the scoped filter
         deliberately leaves the field set on the at-limit path.
         """
+        harness.force_proactive(monkeypatch)
         assert harness.tick_with_usage({
             "1": _usage(92, self._days_out(harness, 500)),
             "2": _usage(10, self._days_out(harness, 400)),
@@ -4350,7 +4430,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_a_filtered_candidate_does_not_forge_an_all_exhausted_claim(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """The filter runs BEFORE `truly_exhausted`, so it hides the evidence.
 
@@ -4374,6 +4454,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(92, self._days_out(h, 500)),
@@ -4395,7 +4476,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_the_bar_does_not_hide_the_account_from_the_census(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """Barring a candidate must not make it cease to EXIST.
 
@@ -4417,6 +4498,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(92, self._days_out(h, 500)),
@@ -4437,7 +4519,7 @@ class TestHorizonAxisDoesNotFlap:
             "fleet"
         )
 
-    def test_the_bar_lifts_when_it_would_leave_nothing(self, temp_home):
+    def test_the_bar_lifts_when_it_would_leave_nothing(self, temp_home, monkeypatch):
         """Identity has no release of its own, and the ratio cannot cover it.
 
         `lastSwitchFrom` is rewritten only by a successful switch — the one
@@ -4454,6 +4536,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage7(95, 95, self._days_out(h, 500)),
@@ -4519,7 +4602,7 @@ class TestHorizonAxisDoesNotFlap:
         ],
     )
     def test_the_bar_only_holds_while_the_engine_is_where_it_landed(
-        self, temp_home, landed, live, expect
+        self, temp_home, landed, live, expect, monkeypatch
     ):
         """A MANUAL switch away from the landing undoes the move the bar guards.
 
@@ -4564,6 +4647,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
         # Fixed absolute instants: account 1's reset must be the SAME instant
         # at departure and on the deciding tick, or the recovery leg reads a
         # reset creeping nearer as a genuine improvement and releases.
@@ -4652,7 +4736,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_the_bar_lifts_when_the_only_alternative_cannot_be_chosen(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """Existing is not the same as being an alternative.
 
@@ -4675,6 +4759,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(92, self._days_out(h, 500)),
@@ -4699,7 +4784,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_the_bar_lifts_for_an_alternative_the_ranking_would_reject(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """Not-at-its-limit is not the same as rankable.
 
@@ -4727,6 +4812,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(92, self._days_out(h, 500)),
@@ -4775,7 +4861,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_the_bar_lifts_for_a_peer_returning_inside_the_horizon(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """The release had no condition on the RECOVERY axis at all.
 
@@ -4798,6 +4884,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(92, self._days_out(h, 500)),
@@ -4819,7 +4906,7 @@ class TestHorizonAxisDoesNotFlap:
             "out while a peer is back in one"
         )
 
-    def test_the_same_fleet_moves_with_the_bar_cleared(self, temp_home):
+    def test_the_same_fleet_moves_with_the_bar_cleared(self, temp_home, monkeypatch):
         """The control for the test above: identical state, no bar.
 
         Without this, a stall could be the fleet's own numbers rather than the
@@ -4831,6 +4918,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(92, self._days_out(h, 500)),
@@ -4849,7 +4937,7 @@ class TestHorizonAxisDoesNotFlap:
             "not the bar, and that assertion is measuring nothing"
         )
 
-    def test_the_bar_reaches_the_ranking_through_tick(self, temp_home):
+    def test_the_bar_reaches_the_ranking_through_tick(self, temp_home, monkeypatch):
         """The bar's production WIRING, which nothing pinned.
 
         `_no_return_account` is computed inside `_rank` and threaded into
@@ -4884,6 +4972,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
         assert h.tick_with_usage({
             "1": _usage(92, self._days_out(h, 500)),
             "2": _usage(10, self._days_out(h, 400)),
@@ -4922,7 +5011,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_the_release_needs_the_barred_account_to_have_improved(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """An empty barred ranking is a reason to ASK, not a reason to release.
 
@@ -4968,6 +5057,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(96, self._days_out(h, 500)),   # 4 pts
@@ -4996,7 +5086,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_the_release_fires_on_this_same_fleet_once_the_peer_actually_improves(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """The release partner for the hold above: SAME fleet, PEER moves.
 
@@ -5015,6 +5105,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(96, self._days_out(h, 500)),   # 4 pts
@@ -5275,7 +5366,7 @@ class TestHorizonAxisDoesNotFlap:
             "unreadable active must not unconditionally release it"
         )
 
-    def test_a_reset_that_crept_nearer_is_not_a_recovery(self, temp_home):
+    def test_a_reset_that_crept_nearer_is_not_a_recovery(self, temp_home, monkeypatch):
         """The recovery leg carries `RECOVERY_HYSTERESIS_S`, and it must.
 
         Without a margin (`< was - 0.0`) any reset that moved a second nearer
@@ -5298,6 +5389,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         depart = self._at(h, 500 * 3600)
         assert h.tick_with_usage({
@@ -5324,7 +5416,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_an_unschedulable_account_that_gained_a_reset_has_recovered(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """`inf` is the right departure value for an unknown reset, not zero.
 
@@ -5344,6 +5436,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(96),                            # 4 pts, NO reset known
@@ -5750,7 +5843,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_the_recovery_leg_requires_the_actives_reset_to_be_known_not_merely_absent(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """`_binding_recovery_ts` returns `inf` for FIVE states, only two
         of which mean "never" (unreadable, token-expired
@@ -5796,6 +5889,7 @@ class TestHorizonAxisDoesNotFlap:
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
             h.make_live("a@example.com", 1)
+            h.force_proactive(monkeypatch)
 
             outcome = None
             for _ in range(3):  # unhealthy_ticks default is 3
@@ -5818,7 +5912,7 @@ class TestHorizonAxisDoesNotFlap:
             )
 
     def test_the_isfinite_guard_must_not_hold_when_a_near_peer_is_available(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """`math.isfinite(active_recovery_ts)` reads ALL FIVE `inf` states
         as "unknown, hold" -- but two of them are
@@ -5879,6 +5973,7 @@ class TestHorizonAxisDoesNotFlap:
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
             h.make_live("a@example.com", 1)
+            h.force_proactive(monkeypatch)
 
             outcome = None
             for _ in range(3):  # unhealthy_ticks default is 3
@@ -5901,7 +5996,7 @@ class TestHorizonAxisDoesNotFlap:
             )
 
     def test_left_snapshot_uses_the_ranking_now_not_a_fresh_clock_read(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """`left_snapshot` used to re-read `self.clock()` AFTER the
         ranking had already decided on a `now`, instead of reusing
@@ -5921,6 +6016,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         ranking_now = 1_000_000.0
         reset_at = self._iso_at(ranking_now + 100.0)   # future at ranking_now
@@ -5958,7 +6054,7 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def test_the_all_spent_stall_above_is_the_floor_not_the_fleet(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """Control for the test above: strip the failover snapshot to the
         pre-upgrade shape on the IDENTICAL fleet, and it switches on the very
@@ -5969,6 +6065,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         outcome = None
         for _ in range(3):
@@ -6058,7 +6155,7 @@ class TestHorizonAxisDoesNotFlap:
         assert h.active_number() == 1
 
     def test_the_release_fires_when_the_barred_account_recovered(
-        self, temp_home
+        self, temp_home, monkeypatch
     ):
         """The control: same fleet, same bar, the barred account IS better.
 
@@ -6072,6 +6169,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(96, self._days_out(h, 500)),
@@ -6093,7 +6191,9 @@ class TestHorizonAxisDoesNotFlap:
             "2-account lockout, not anti-flap"
         )
 
-    def test_the_ratio_release_changes_where_the_engine_lands(self, temp_home):
+    def test_the_ratio_release_changes_where_the_engine_lands(
+        self, temp_home, monkeypatch
+    ):
         """`left >= active x HORIZON_HEADROOM_RATIO` — worth 50 points, unpinned.
 
         Measured: replacing the whole condition with `False` left the full
@@ -6116,6 +6216,7 @@ class TestHorizonAxisDoesNotFlap:
         h.seed(2, "b@example.com")
         h.seed(3, "c@example.com")
         h.make_live("a@example.com", 1)
+        h.force_proactive(monkeypatch)
 
         assert h.tick_with_usage({
             "1": _usage(92, self._days_out(h, 500)),
@@ -6198,7 +6299,7 @@ class TestHorizonAxisDoesNotFlap:
             "answering from the stale snapshot the ranking had replaced"
         )
 
-    def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
+    def test_the_fallback_never_outranks_a_real_qualifier(self, harness, monkeypatch):
         """It runs only when nothing else qualifies, and the key is why.
 
         The fallback's key is tier 0; every ordinary candidate is tier 1. So
@@ -6211,6 +6312,7 @@ class TestHorizonAxisDoesNotFlap:
         Active is spent (3 pts). One peer qualifies outright on headroom; one
         margin-failure peer resets sooner. The qualifier must win.
         """
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(97, self._days_out(harness, 500)),   # active, 3 left
             "2": _usage(94, self._days_out(harness, 400)),   # 6 left: qualifies
@@ -6222,7 +6324,7 @@ class TestHorizonAxisDoesNotFlap:
             "outranked a candidate with twice the headroom"
         )
 
-    def test_the_fallback_ranks_by_reset_not_by_headroom(self, harness):
+    def test_the_fallback_ranks_by_reset_not_by_headroom(self, harness, monkeypatch):
         """`(0, recovery_ts, -h)` — the reset leads, and that is deliberate.
 
         Every account in the fallback is spent, and below SPENT_HEADROOM_PCT a
@@ -6244,6 +6346,7 @@ class TestHorizonAxisDoesNotFlap:
         Taking acct 3 buys 1.1 points, worth minutes, at the cost of 40 hours
         of waiting.
         """
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(98, self._days_out(harness, 300)),    # active, 2 left
             "2": _usage(98, self._days_out(harness, 10)),     # 2 left, soonest
@@ -6255,8 +6358,9 @@ class TestHorizonAxisDoesNotFlap:
             "headroom over a reset 40 hours sooner"
         )
 
-    def test_a_materially_better_peer_still_wins(self, harness):
+    def test_a_materially_better_peer_still_wins(self, harness, monkeypatch):
         """The escape must survive: 2 points left against 10 is a real move."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(98, self._days_out(harness, 109)),   # active, 2 left
             "2": _usage(90, self._days_out(harness, 80)),    # 10 left — 5x
@@ -6265,8 +6369,9 @@ class TestHorizonAxisDoesNotFlap:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
 
-    def test_a_minutes_away_reset_is_unaffected(self, harness):
+    def test_a_minutes_away_reset_is_unaffected(self, harness, monkeypatch):
         """Inside the horizon the recovery axis still decides, ratio or not."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(91, self._at(harness, 7200)),
             "2": _usage(94, self._at(harness, 1800)),
@@ -6502,8 +6607,9 @@ class TestAllSpentGoesToTheSoonestReset:
             .replace("+00:00", "Z")
         )
 
-    def test_all_spent_moves_to_the_soonest_reset(self, harness):
+    def test_all_spent_moves_to_the_soonest_reset(self, harness, monkeypatch):
         """The reported shape: 99/99/99, days out, active resets last."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._at(harness, 109 * 3600)),  # active, LAST
             "2": _usage(99, self._at(harness, 80 * 3600)),
@@ -6525,9 +6631,10 @@ class TestAllSpentGoesToTheSoonestReset:
         assert outcome is not TickOutcome.SWITCHED
         assert harness.active_number() == 1
 
-    def test_real_headroom_still_beats_a_sooner_reset(self, harness):
+    def test_real_headroom_still_beats_a_sooner_reset(self, harness, monkeypatch):
         """Above the spent band the headroom axis still rules: a peer holding
         ten points wins even though a spent one resets sooner."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(98, self._at(harness, 109 * 3600)),  # active, 2 left
             "2": _usage(90, self._at(harness, 80 * 3600)),   # 10 left
@@ -6537,7 +6644,7 @@ class TestAllSpentGoesToTheSoonestReset:
         assert harness.active_number() == 2
 
     def test_a_spent_fleet_takes_the_soonest_reset_over_the_most_headroom(
-        self, harness
+        self, harness, monkeypatch
     ):
         """`_recovery_is_useful`'s spent clause, as a whole, was unpinned.
 
@@ -6562,6 +6669,7 @@ class TestAllSpentGoesToTheSoonestReset:
 
         Asserts the DESTINATION — both answers are a switch.
         """
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99.5, self._at(harness, 300 * 3600)),  # active, 0.5 pt
             "2": _usage(99.5, self._at(harness, 10 * 3600)),   # 0.5 pt, SOON
@@ -6613,9 +6721,15 @@ class TestEscapeBeforeTheLimitLands:
             .replace("+00:00", "Z")
         )
 
-    def test_at_99_the_proactive_path_already_escapes(self, harness):
+    def test_at_99_the_proactive_path_already_escapes(self, harness, monkeypatch):
         """No special trigger needed: 99% is over the threshold and a healthy
-        peer clears the margin."""
+        peer clears the margin. Forced past hot-zone (which now defers a
+        single-tick 99% reading rather than act on it immediately -- the
+        whole point of the isolated-/usage-probe redesign) so this stays a
+        pin on the INVARIANT the class docstring documents: "at-limit"
+        stays bound to headroom<=0 and never absorbs the recovery/
+        spent-band rankings that belong to "proactive"."""
+        harness.force_proactive(monkeypatch)
         outcome = harness.tick_with_usage({
             "1": _usage(99, self._at(harness, 109 * 3600)),  # active, 1 left
             "2": _usage(70, self._at(harness, 80 * 3600)),   # 30 left
@@ -6840,7 +6954,7 @@ class TestFreshenRoutesThroughGate:
             h.engine, "_freshen_target", side_effect=by_slot
         ):
             h.tick_with_usage({
-                "1": _usage7(95, 95, _R_LATER),   # active, over threshold
+                "1": _usage7(100, 95, _R_LATER),   # active, at limit
                 "2": _usage7(10, 10, _R_SOON),
                 "3": _usage7(10, 10, _R_LATEST),
             })
@@ -7108,3 +7222,264 @@ class TestWarmOnReset:
         assert ping.status == "sent"
         assert h.active_number() == 1  # never touched
         assert h.state() == {}
+
+
+class TestHotZone:
+    """The active account at/past `threshold` but under 100%: instead of an
+    immediate `"proactive"` switch (the old behaviour), probe real usage via
+    an isolated `/usage` call (`SessionManager.fetch_hot_usage`) at tiered
+    cadence and only switch once a fresh read hits 100% — see
+    `_hot_zone_decide`'s docstring."""
+
+    def _harness(self, temp_home: Path, **settings_kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=90.0, **settings_kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _mock_probe(self, h: EngineHarness, monkeypatch, result):
+        """``result`` is a dict (success), ``None`` (failure), or a callable
+        of ``identifier`` for more control. Also returns the call log."""
+        calls: list[str] = []
+        fn = result if callable(result) else (lambda identifier: result)
+        monkeypatch.setattr(
+            h.engine._session_manager,
+            "fetch_hot_usage",
+            lambda identifier: calls.append(identifier) or fn(identifier),
+        )
+        return calls
+
+    def test_crossing_threshold_does_not_switch_immediately(
+        self, temp_home, monkeypatch
+    ):
+        """The behaviour change itself: 95% (over threshold, under 100) no
+        longer triggers an immediate proactive switch — it waits on the
+        probe. An unmocked probe fails fast (no real credential to
+        bootstrap) and counts as one of `HOT_ZONE_MAX_PROBE_FAILURES`, not
+        an immediate fallback."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["hot-zone"]
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
+    def test_probe_not_yet_due_is_not_called_again(self, temp_home, monkeypatch):
+        h = self._harness(temp_home)
+        calls = self._mock_probe(
+            h, monkeypatch, {"session_pct": 95.0, "week_pct": 20.0}
+        )
+        h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert calls == ["1"]
+        h.events.clear()
+
+        # Same tick's tier (60s at 95%) hasn't elapsed — no second call.
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == ["1"]
+        assert not any(isinstance(e, HotProbeEvent) for e in h.events)
+
+    def test_probe_due_and_below_100_updates_state_without_switching(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        self._mock_probe(h, monkeypatch, {"session_pct": 96.0, "week_pct": 20.0})
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        probe = next(e for e in h.events if isinstance(e, HotProbeEvent))
+        assert probe.status == "ok"
+        assert probe.session_pct == 96.0
+        assert probe.week_pct == 20.0
+        assert h.state()["hotProbe"] == {
+            "number": "1", "at": h.clock.now, "session_pct": 96.0, "week_pct": 20.0,
+        }
+
+    def test_week_pct_binding_switches_even_when_session_pct_is_low(
+        self, temp_home, monkeypatch
+    ):
+        """`hot_pct = max(session_pct, week_pct)` — the weekly cap alone
+        hitting 100% must switch even with session usage nowhere close."""
+        h = self._harness(temp_home)
+        self._mock_probe(h, monkeypatch, {"session_pct": 10.0, "week_pct": 100.0})
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_session_pct_100_switches_this_same_tick_and_bypasses_cooldown(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        h.engine._mutate_state(
+            lambda s: s.update(lastSwitchAt=h.clock() - 10)  # fresh cooldown
+        )
+        self._mock_probe(h, monkeypatch, {"session_pct": 100.0, "week_pct": 5.0})
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_repeated_probe_failures_fall_back_to_proactive(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, None)
+        usage = {"1": _usage(95), "2": _usage(10)}
+        outcome = None
+        for _ in range(HOT_ZONE_MAX_PROBE_FAILURES):
+            outcome = h.tick_with_usage(usage)
+            h.clock.advance(61.0)  # past the 60s tier-1 interval
+        assert len(calls) == HOT_ZONE_MAX_PROBE_FAILURES
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        failed = [e for e in h.events if isinstance(e, HotProbeEvent)]
+        assert all(e.status == "failed" for e in failed)
+
+    def test_probe_dropping_below_threshold_clears_state(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        self._mock_probe(h, monkeypatch, {"session_pct": 96.0, "week_pct": 20.0})
+        h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert "hotProbe" in h.state()
+        h.events.clear()
+        h.clock.advance(61.0)
+
+        # A burst subsided: the fresh read is back under threshold.
+        self._mock_probe(h, monkeypatch, {"session_pct": 50.0, "week_pct": 10.0})
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert "hotProbe" not in h.state(), (
+            "a probe reporting a drop back under threshold must self-heal, "
+            "not keep waiting on stale hot-zone state"
+        )
+
+    def test_official_at_limit_short_circuits_without_probing(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 50.0, "week_pct": 50.0})
+        outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert calls == [], "the official endpoint already says 100% -- no probe needed"
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_live_manual_session_is_never_probed_over(self, temp_home, monkeypatch):
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 99.0, "week_pct": 5.0})
+        monkeypatch.setattr(
+            h.switcher, "live_session_pids_for", lambda num, email: [4242]
+        )
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == []
+
+    def test_dry_run_never_calls_the_probe(self, temp_home, monkeypatch):
+        h = self._harness(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 100.0, "week_pct": 5.0})
+
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == [], "dry-run must never spawn the real (or mocked) probe"
+
+        # Dry-run mirrors real behaviour: only a literal 100% (from the
+        # official reading) triggers the preview switch.
+        outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        assert calls == []
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+        assert switch.dry_run is True
+
+    def test_week_alone_between_threshold_and_98_is_never_probed(
+        self, temp_home, monkeypatch
+    ):
+        """The week (7d) axis doesn't engage its own probing until 98% —
+        90-97% with a low session pct is nothing to watch tightly yet."""
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 5.0, "week_pct": 93.0})
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 93.0}},
+            "2": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == [], "week at 93% (< WEEK_HOT_ZONE_ENTRY_PCT) must not be probed"
+
+    def test_week_crossing_98_engages_its_own_fixed_cadence(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 5.0, "week_pct": 98.5})
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 98.5}},
+            "2": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == ["1"]
+        probe = next(e for e in h.events if isinstance(e, HotProbeEvent))
+        assert probe.week_pct == 98.5
+        assert h.state()["hotProbe"]["week_pct"] == 98.5
+        assert h.engine._hot_zone_deadline_ts == (
+            h.clock.now + poll_policy.WEEK_HOT_PROBE_INTERVAL_S
+        ), "week-only engagement uses its own fixed cadence, not the session tiers"
+
+    def test_week_hitting_100_switches_even_with_a_wide_open_session(
+        self, temp_home, monkeypatch
+    ):
+        h = self._harness(temp_home)
+        self._mock_probe(h, monkeypatch, {"session_pct": 5.0, "week_pct": 100.0})
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 98.5}},
+            "2": _usage(10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+    def test_both_axes_engaged_still_cost_a_single_probe_call(
+        self, temp_home, monkeypatch
+    ):
+        """Session at 96% and week at 98% are both individually engaged —
+        one `/usage` call reports both numbers, so this must never spawn
+        two separate probes for the same tick."""
+        h = self._harness(temp_home)
+        calls = self._mock_probe(h, monkeypatch, {"session_pct": 96.0, "week_pct": 98.0})
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 96.0}, "seven_day": {"pct": 98.0}},
+            "2": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert calls == ["1"], f"expected exactly one probe call, got {calls}"
+        # The tighter of the two engaged cadences wins (session's tier-2
+        # 30s, same as week's fixed 30s here) — never a slower one.
+        assert h.engine._hot_zone_deadline_ts == h.clock.now + poll_policy.HOT_TIER_2_S
+
+    def test_probe_failures_do_not_carry_over_to_a_different_active_account(
+        self, temp_home, monkeypatch
+    ):
+        """A consecutive-failure count racked up on one account must not
+        trip the safety net on a different account's very first failure."""
+        h = self._harness(temp_home)
+        h.engine._hot_zone_failures = HOT_ZONE_MAX_PROBE_FAILURES - 1
+        h.engine._hot_zone_failures_for = "1"
+        h.make_live("b@example.com", 2)  # account 2 is active now
+        self._mock_probe(h, monkeypatch, None)
+
+        outcome = h.tick_with_usage({"1": _usage(10), "2": _usage(95)})
+
+        assert outcome is TickOutcome.NO_ACTION, (
+            "one failure on a freshly-active account must not immediately "
+            "trip the fallback just because a different account had "
+            "already accumulated failures"
+        )
+        assert h.engine._hot_zone_failures == 1
+        assert h.engine._hot_zone_failures_for == "2"

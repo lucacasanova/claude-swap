@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -204,6 +205,20 @@ _AUTH_STATUS_TIMEOUT = 10.0
 # local auth-status probe above), so it needs real headroom past a network
 # call plus a short Haiku completion.
 _WARM_PING_TIMEOUT = 60.0
+
+# `fetch_hot_usage`'s `/usage` is handled entirely client-side (no model
+# turn — measured `duration_api_ms: 0`), consistently under ~1s in
+# testing; generous margin, still well under the tightest hot-zone tier
+# (poll_policy.HOT_TIER_3_S = 20s) so probes never stack up.
+_HOT_USAGE_TIMEOUT = 15.0
+
+# Matches both "Current session: 19% used" and "Current week (all
+# models): 49% used" (the parenthetical also covers a scoped per-model
+# weekly line, e.g. "Current week (Opus): 12% used") in `/usage`'s panel
+# text.
+_HOT_USAGE_RE = re.compile(
+    r"Current (session|week)\b[^\n%]*?(\d+(?:\.\d+)?)%\s*used"
+)
 
 # Bootstrap holds the backup-dir lock across one token refresh (10s network
 # timeout) plus auth-status probes, so it needs more headroom than the
@@ -496,6 +511,30 @@ def _probe_env(session_dir: Path) -> dict[str, str]:
     return env
 
 
+def _spawn_in_session(
+    argv_tail: list[str], session_dir: Path, timeout: float
+) -> subprocess.CompletedProcess | None:
+    """Run ``claude <argv_tail...>`` in ``session_dir``'s isolated env.
+
+    Shared by every one-shot headless call through an isolated profile
+    (`ping_to_warm`, `fetch_hot_usage`) — same binary resolution, same env,
+    same timeout/spawn-failure handling. Returns ``None`` on a timeout or a
+    spawn failure (binary missing, etc.); callers treat that the same as a
+    non-zero exit.
+    """
+    claude_bin = shutil.which("claude") or "claude"
+    try:
+        return subprocess.run(
+            [claude_bin, *argv_tail],
+            env=_probe_env(session_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
 class SessionManager:
     """Bootstraps per-account session profiles and launches Claude into them."""
 
@@ -503,6 +542,8 @@ class SessionManager:
         self.switcher = switcher
         self.sessions_dir = switcher.backup_dir / "sessions"
         self._logger = switcher._logger
+        # `fetch_hot_usage`'s own cache — see its docstring.
+        self._hot_usage_dirs: dict[str, Path] = {}
 
     # -- launch ----------------------------------------------------------
 
@@ -823,18 +864,68 @@ class SessionManager:
             session_dir, _num, _email = self.setup_session(identifier, share=False)
         except SessionError:
             return False
-        claude_bin = shutil.which("claude") or "claude"
+        result = _spawn_in_session(
+            ["-p", "hi", "--model", "haiku"], session_dir, _WARM_PING_TIMEOUT
+        )
+        return result is not None and result.returncode == 0
+
+    def fetch_hot_usage(self, identifier: str) -> dict[str, float] | None:
+        """Read ``identifier``'s live "Current session"/"Current week" pct
+        straight from the CLI's own ``/usage`` panel, through its isolated
+        session profile — never the active credential, same as
+        `ping_to_warm`.
+
+        Unlike the official ``/api/oauth/usage`` HTTP endpoint (rate-limited
+        to ~28-30 requests/hour, see ``poll_policy``'s module docstring),
+        ``/usage`` is a local CLI command handled entirely client-side — no
+        model turn, `$0`, zero tokens — and wasn't throttled at all in
+        testing well past that budget. Meant for `autoswitch._hot_zone_decide`'s
+        tight-cadence probing once the active account nears its real limit.
+
+        Caches ``identifier``'s session dir across calls: hot-zone calls
+        this every 20-60s for the same account, and `setup_session`'s reuse
+        path still spawns a full `claude auth status` probe and re-syncs
+        sharing on every call — needless work when nothing about the
+        profile can have changed between one probe and the next. A cache
+        hit skips straight to the `/usage` spawn; a failed spawn evicts the
+        entry so the *next* call re-validates (and re-bootstraps if truly
+        needed) instead of hammering a profile that may have gone stale.
+
+        Returns ``{"session_pct": ..., "week_pct": ...}`` — each the max
+        across every matching line (folding in any scoped per-model weekly
+        window automatically) — or ``None`` on any failure: bootstrap,
+        spawn, timeout, non-zero exit, unparseable JSON, or a panel shape
+        that doesn't match what's parsed here.
+        """
+        session_dir = self._hot_usage_dirs.get(identifier)
+        if session_dir is None:
+            try:
+                session_dir, _num, _email = self.setup_session(identifier, share=False)
+            except SessionError:
+                return None
+            self._hot_usage_dirs[identifier] = session_dir
+
+        result = _spawn_in_session(
+            ["-p", "/usage", "--model", "haiku", "--output-format", "json"],
+            session_dir, _HOT_USAGE_TIMEOUT,
+        )
+        if result is None or result.returncode != 0:
+            self._hot_usage_dirs.pop(identifier, None)
+            return None
         try:
-            result = subprocess.run(
-                [claude_bin, "-p", "hi", "--model", "haiku"],
-                env=_probe_env(session_dir),
-                capture_output=True,
-                text=True,
-                timeout=_WARM_PING_TIMEOUT,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return False
-        return result.returncode == 0
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        text = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(text, str):
+            return None
+        pcts: dict[str, float] = {}
+        for label, value in _HOT_USAGE_RE.findall(text):
+            key = "session_pct" if label.lower() == "session" else "week_pct"
+            pcts[key] = max(pcts.get(key, 0.0), float(value))
+        if "session_pct" not in pcts or "week_pct" not in pcts:
+            return None
+        return pcts
 
     def _profile_matches_backup(
         self, session_dir: Path, account_num: str, email: str

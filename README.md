@@ -82,11 +82,11 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it stops trusting Anthropic's official usage API — which is only safe to poll every ~60s and routinely lags a busy session past the mark — and starts reading real usage straight from the account's own `/usage` panel through an isolated session profile: the fast-moving 5-hour window at cadence tightening from 60s down to 20s the closer that gets to 100%, the much slower 7-day window only once it separately nears 100% (98%+) at a steady 30s. It switches to the account with the most quota left the instant a fresh read reports 100% on either window — no quota left unspent on a stale reading, and safe to run while Claude Code is working:
 
 ```bash
 cswap auto                     # foreground loop, polls every 60s
-cswap auto --threshold 80      # switch earlier
+cswap auto --threshold 80      # start watching earlier
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
@@ -99,6 +99,7 @@ cswap auto --warm-on-reset            # ping an idle account right when its 5h w
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
+- **Past the threshold**: rather than switch on Anthropic's official usage API — safe to poll only every ~60s, so a heavy subagent turn regularly burns past the threshold before the next poll catches it — cswap sends `/usage` through the account's own isolated session profile (same isolation as `--warm-on-reset`, never the active credential) and watches the real number. The two windows are watched on different terms, since one is a fast-recycling resource and the other isn't: the 5-hour window, every 60s from the threshold up to 96%, 30s from 96-99%, 20s from 99% up; the 7-day window — far slower-moving, so tight probing from 90% would mostly be wasted spawns — only starts its own watch once it separately crosses 98%, at a steady 30s. One `/usage` call always reports both numbers, so a tick with both windows past their own gate still costs a single probe, at whichever cadence is tighter. It's a local CLI command, not a real request (no model turn, `$0`, no tokens), so it isn't subject to the official endpoint's rate budget. The switch fires the instant a fresh read reports 100% on either window — so a weekly cap hit while the session window is nowhere close still switches right away.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
@@ -336,7 +337,7 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 </details>
 
-`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`, and (with `--warm-on-reset`) `warm-ping`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+`cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`, `hot-probe` (see the threshold behavior above), and (with `--warm-on-reset`) `warm-ping`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
 ### Add an account from a raw token or API key
 

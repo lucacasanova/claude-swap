@@ -869,6 +869,186 @@ class TestPingToWarm:
         assert seen["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path)
 
 
+class TestFetchHotUsage:
+    """`SessionManager.fetch_hot_usage`: the hot-zone tight-cadence probe —
+    reads real `Current session`/`Current week` pct from the CLI's own
+    `/usage` panel through the account's isolated session profile, never
+    the active credential."""
+
+    def _mock_setup_session(self, manager, monkeypatch, session_dir):
+        monkeypatch.setattr(
+            manager,
+            "setup_session",
+            lambda identifier, share=False, share_history=False: (
+                session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+            ),
+        )
+
+    def _mock_run(self, monkeypatch, *, returncode=0, stdout="", stderr=""):
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(
+                returncode=returncode, stdout=stdout, stderr=stderr
+            ),
+        )
+
+    def _payload(self, result_text: str) -> str:
+        return json.dumps({"result": result_text})
+
+    def test_ok_parses_both_labels_and_takes_the_max(
+        self, manager, tmp_path, monkeypatch
+    ):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        self._mock_run(
+            monkeypatch,
+            stdout=self._payload(
+                "Current session: 19% used · resets Sep 7, 4:29pm\n"
+                "Current week (all models): 49% used · resets Sep 11, 6:59pm\n"
+            ),
+        )
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) == {
+            "session_pct": 19.0, "week_pct": 49.0,
+        }
+
+    def test_scoped_weekly_line_folds_in_as_the_max_week_pct(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """A per-model scoped weekly window shows as its own `Current week
+        (X)` line — the higher of it and the account-wide weekly pct must
+        win, mirroring `oauth.account_headroom`'s binding-window pick."""
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        self._mock_run(
+            monkeypatch,
+            stdout=self._payload(
+                "Current session: 10% used\n"
+                "Current week (all models): 20% used\n"
+                "Current week (Opus): 97% used\n"
+            ),
+        )
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) == {
+            "session_pct": 10.0, "week_pct": 97.0,
+        }
+
+    def test_setup_session_failure_never_spawns(self, manager, monkeypatch):
+        def boom(identifier, share=False, share_history=False):
+            raise SessionError("profile could not be bootstrapped")
+
+        monkeypatch.setattr(manager, "setup_session", boom)
+        spawned = []
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda *a, **k: spawned.append(a) or SimpleNamespace(returncode=0),
+        )
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+        assert spawned == []
+
+    def test_nonzero_exit_is_a_failure(self, manager, tmp_path, monkeypatch):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        self._mock_run(monkeypatch, returncode=1, stderr="oops")
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+
+    def test_timeout_is_a_failure(self, manager, tmp_path, monkeypatch):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+
+        def raise_timeout(*a, **k):
+            raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=15)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+
+    def test_missing_binary_is_a_failure(self, manager, tmp_path, monkeypatch):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+
+        def raise_oserror(*a, **k):
+            raise OSError("claude not found")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", raise_oserror)
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+
+    def test_malformed_json_is_a_failure(self, manager, tmp_path, monkeypatch):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        self._mock_run(monkeypatch, stdout="not json")
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+
+    def test_missing_a_label_is_a_failure(self, manager, tmp_path, monkeypatch):
+        """The panel's shape didn't match what we expect — never guess a
+        missing window as 0%, that could look like real headroom."""
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        self._mock_run(
+            monkeypatch, stdout=self._payload("Current session: 19% used\n")
+        )
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+
+    def test_uses_the_isolated_profile_and_a_cheap_headless_call(
+        self, manager, tmp_path, monkeypatch
+    ):
+        self._mock_setup_session(manager, monkeypatch, tmp_path)
+        seen: dict = {}
+
+        def capture_run(argv, env=None, **kwargs):
+            seen["argv"] = argv
+            seen["env"] = env
+            return SimpleNamespace(
+                returncode=0,
+                stdout=self._payload(
+                    "Current session: 1% used\nCurrent week: 2% used\n"
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", capture_run)
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is not None
+        assert seen["argv"][1:] == [
+            "-p", "/usage", "--model", "haiku", "--output-format", "json",
+        ]
+        assert seen["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+
+    def test_repeat_calls_reuse_the_session_dir_without_resetting_up(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """Hot-zone calls this every 20-60s for the same account —
+        `setup_session`'s reuse path still spawns its own probe and
+        re-syncs sharing on every call, so a second call for the same
+        identifier must skip straight to the `/usage` spawn."""
+        setup_calls = []
+        monkeypatch.setattr(
+            manager,
+            "setup_session",
+            lambda identifier, share=False, share_history=False: (
+                setup_calls.append(identifier) or (tmp_path, ACCOUNT_NUM, ACCOUNT_EMAIL)
+            ),
+        )
+        self._mock_run(
+            monkeypatch,
+            stdout=self._payload("Current session: 1% used\nCurrent week: 2% used\n"),
+        )
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is not None
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is not None
+        assert setup_calls == [ACCOUNT_NUM], "setup_session must run only once"
+
+    def test_a_failed_spawn_evicts_the_cached_dir_so_the_next_call_revalidates(
+        self, manager, tmp_path, monkeypatch
+    ):
+        setup_calls = []
+        monkeypatch.setattr(
+            manager,
+            "setup_session",
+            lambda identifier, share=False, share_history=False: (
+                setup_calls.append(identifier) or (tmp_path, ACCOUNT_NUM, ACCOUNT_EMAIL)
+            ),
+        )
+        self._mock_run(monkeypatch, returncode=1, stderr="stale session")
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+        assert manager.fetch_hot_usage(ACCOUNT_NUM) is None
+        assert setup_calls == [ACCOUNT_NUM, ACCOUNT_NUM], (
+            "a failed spawn must evict the cache so the profile is "
+            "re-validated (and re-bootstrapped if needed) next time, "
+            "instead of repeatedly hammering a profile that went stale"
+        )
+
+
 # ---------------------------------------------------------------------------
 # sharing
 # ---------------------------------------------------------------------------

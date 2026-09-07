@@ -31,7 +31,9 @@ SEV_CRIT = "#d75f5f"  # soft red: near the limit (>= 90%)
 TRACK = "#3a3a3a"  # unfilled bar track
 
 # Severity band edges. WARN mirrors where a user starts caring; CRIT mirrors
-# the auto-switch default threshold so bar color and switch behavior agree.
+# the auto-switch default threshold, so the bar turns red exactly where
+# auto-switch stops trusting the slow official poll and starts closely
+# watching via `/usage` (the actual switch lands later, at 100%).
 WARN_PCT = 70.0
 CRIT_PCT = 90.0
 

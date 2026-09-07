@@ -245,7 +245,8 @@ class AccountListScreen(Screen):
             previous = listview.index
             await listview.clear()
             await listview.extend(
-                AccountItem(acc, pinging=snap.pinging) for acc in snap.accounts
+                AccountItem(acc, pinging=snap.pinging, hot_probe=snap.hot_probe)
+                for acc in snap.accounts
             )
             self._numbers = numbers
             listview.index = (
@@ -255,7 +256,7 @@ class AccountListScreen(Screen):
             )
         else:
             for item, acc in zip(listview.query(AccountItem), snap.accounts):
-                item.set_account(acc, snap.pinging)
+                item.set_account(acc, snap.pinging, snap.hot_probe)
         self._flash_updated(snap, listview)
 
     def _index_after_build(

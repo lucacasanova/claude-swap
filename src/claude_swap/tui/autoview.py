@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 _EVENT_ROLES = {
     "switch": "accent",
     "warm-ping": "accent",
+    "hot-probe": "accent",
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
@@ -289,7 +290,8 @@ class AutoScreen(Screen):
             self.app.push_screen(
                 ConfirmModal(
                     "Go live? claude-swap will switch your active account "
-                    "automatically when the threshold is reached.\n\n"
+                    "automatically once it's actually out of quota — closely "
+                    "watched from the threshold on.\n\n"
                     "(Same behavior as running `cswap auto` in a terminal.)",
                     title="Go live",
                     yes_label="Go live",

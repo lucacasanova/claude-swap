@@ -146,6 +146,42 @@ ESCALATION_MARGIN_PCT = 15.0
 # usage is obsolete the moment the window rolls over.
 RESET_SLACK_S = 60.0
 
+# Hot-zone cadence: once the active account's binding utilization reaches
+# `settings.threshold`, the engine stops trusting the official
+# `/api/oauth/usage` endpoint's ~60s-floor cadence (see the module
+# docstring's budget numbers) and instead probes real usage via the
+# `claude` CLI's own `/usage` command through an isolated session profile
+# (`SessionManager.fetch_hot_usage`) — a channel that costs nothing and
+# isn't subject to that same budget (measured 2026-09-07: 8 calls at 4s
+# spacing, zero 429s), so it can be polled this tightly indefinitely.
+#
+# The two windows `/usage` reports are watched on different terms (see
+# `autoswitch._hot_zone_decide`). These tiers are the 5-hour (session)
+# axis's — it resets in hours, so a burst can blow through it fast.
+# Absolute breakpoints, not relative to `threshold`: what matters is how
+# close the account actually is to its real ceiling.
+HOT_TIER_1_S = 60.0  # pct < 96
+HOT_TIER_2_S = 30.0  # 96 <= pct < 99
+HOT_TIER_3_S = 20.0  # pct >= 99
+
+
+def hot_probe_interval_s(pct: float) -> float:
+    """Hot-zone probe cadence for a session (5h) pct this close to 100%."""
+    if pct >= 99.0:
+        return HOT_TIER_3_S
+    if pct >= 96.0:
+        return HOT_TIER_2_S
+    return HOT_TIER_1_S
+
+
+# The 7-day (week) axis is a far slower-moving resource than the 5-hour
+# one — it rarely swings from comfortable to capped within a single probe
+# interval, so tight tiered probing from `threshold` up would mostly be
+# wasted isolated-session spawns. It gets its own probing only once it
+# individually crosses this (much higher) mark, at one fixed cadence.
+WEEK_HOT_ZONE_ENTRY_PCT = 98.0
+WEEK_HOT_PROBE_INTERVAL_S = 30.0
+
 
 def binding_pct(usage: dict | None, models: tuple[str, ...] = ()) -> float | None:
     """Utilization of the binding (worst) relevant window, or None."""

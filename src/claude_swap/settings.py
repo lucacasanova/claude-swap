@@ -34,13 +34,23 @@ class AutoSwitchSettings:
     """Policy knobs for the auto-switch engine (``cswap auto``).
 
     ``threshold`` is binding-window utilization (max of the 5h/7d percentages):
-    at or above it the engine looks for a better account. 90 rather than 95
-    leaves margin for the macOS ~30s Keychain pickup tail and for heavy
-    subagent turns burning past the mark before a swap lands. A proactive
-    candidate must itself sit below the threshold (never land somewhere that
-    re-triggers next tick) and beat the active account's utilization by at
-    least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    at or above it the engine stops trusting the official usage endpoint's
+    ~60s-floor polling cadence and switches to watching the account closely —
+    reading real usage straight from the CLI's own ``/usage`` command through
+    an isolated session profile (``autoswitch._hot_zone_decide``). The 5h
+    window is watched from here with cadence tightening the closer that gets
+    to 100% (``poll_policy.hot_probe_interval_s``); the far slower-moving 7d
+    window only starts its own watch once it separately nears 100%
+    (``poll_policy.WEEK_HOT_ZONE_ENTRY_PCT``). The actual switch only
+    happens once a fresh read reports 100%, so no real
+    quota is left on the table the way switching at a stale ``threshold``-ish
+    reading used to (a heavy subagent turn easily burns past 90% before the
+    next official poll catches it). 90 rather than 95 leaves margin for the
+    macOS ~30s Keychain pickup tail while this closer watch takes over. The
+    fallback proactive path (repeated probe failures, or ``consume-first``'s
+    below-threshold moves) still requires a candidate to itself sit below the
+    threshold and beat the active account's utilization by at least
+    ``hysteresis_pct``, so two accounts hovering at the line never ping-pong.
     """
 
     threshold: float = 90.0
@@ -116,7 +126,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     for spec in (
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help=(
+                "Start closely watching (isolated /usage probes) once the "
+                "binding 5h/7d window reaches this pct; switches at 100%"
+            ),
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,

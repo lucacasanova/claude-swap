@@ -2,8 +2,10 @@
 
 ``bar_cells``/``usage_bar`` are custom renderers rather than Textual's
 ``ProgressBar`` because the design needs three things the stock widget
-doesn't do: a severity color ramp, an optional threshold tick mark (the
-auto-switch trigger line), and stale-measurement dimming.
+doesn't do: a severity color ramp, an optional threshold tick mark (where
+auto-switch stops trusting the slow official poll and starts closely
+watching via `/usage` — the actual switch only lands at 100%, past the
+right edge), and stale-measurement dimming.
 """
 
 from __future__ import annotations
@@ -168,6 +170,7 @@ def account_card_text(
     now: float | None = None,
     palette: Palette = Palette.DARK,
     pinging: dict | None = None,
+    hot_probe: dict | None = None,
 ) -> Text:
     """The full account card: header line + per-window bar rows.
 
@@ -177,9 +180,24 @@ def account_card_text(
     touches the active credential. "active" always tracks the real live
     credential (``acc.is_active``), completely unaffected by this; the
     account being pinged (``number``) additionally gets a "priming" tag.
+
+    ``hot_probe`` is the raw "hotProbe" entry (``{"number", "at",
+    "session_pct", "week_pct"}``), when the active account is past
+    `threshold` and `cswap auto` is watching it via isolated `/usage`
+    probes instead of the slow official poll
+    (`autoswitch._hot_zone_decide`) — same additive-tag treatment, also
+    never affects ``is_active``. Tagged with the binding (worst) of the
+    two, matching what actually decides the switch. It also overrides the
+    matching 5h/7d bar row with the fresher probed pct (tagged "live",
+    never dimmed stale) — the whole point of hot-zone is that the
+    official reading behind the ordinary bar can be meaningfully behind
+    it while a probe is active.
     """
     now = now if now is not None else time.time()
     pinging_target = str(pinging["number"]) if pinging and "number" in pinging else None
+    hot_probe_target = (
+        str(hot_probe["number"]) if hot_probe and "number" in hot_probe else None
+    )
 
     text = Text()
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.foreground}")
@@ -193,6 +211,12 @@ def account_card_text(
         text.append("   ● active", style=f"bold {palette.accent}")
     if acc.number == pinging_target:
         text.append("   ◐ priming", style=f"bold {palette.sev_warn}")
+    if acc.number == hot_probe_target:
+        session_pct = hot_probe.get("session_pct") if isinstance(hot_probe, dict) else None
+        week_pct = hot_probe.get("week_pct") if isinstance(hot_probe, dict) else None
+        pcts = [p for p in (session_pct, week_pct) if isinstance(p, (int, float))]
+        label = f"   ◑ hot-zone {max(pcts):.0f}%" if pcts else "   ◑ hot-zone"
+        text.append(label, style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
@@ -216,6 +240,30 @@ def account_card_text(
         return text
 
     rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
+
+    # While hot-zone is watching this account, the fresh `/usage` reading
+    # is more current than whatever the official endpoint's own (slower)
+    # cadence last stored — show that number on the matching row instead
+    # of the stale one, tagged "live" so it's clear the two can briefly
+    # disagree with the endpoint's own age display.
+    live_pcts = (
+        {"5h": hot_probe.get("session_pct"), "7d": hot_probe.get("week_pct")}
+        if acc.number == hot_probe_target and isinstance(hot_probe, dict)
+        else {}
+    )
+    live_labels: set[str] = set()
+    if live_pcts:
+        new_rows = []
+        for label, pct, suffix, suffix_full in rows:
+            live = live_pcts.get(label)
+            if isinstance(live, (int, float)):
+                live_labels.add(label)
+                pct = live
+                suffix = f"live · {suffix}" if suffix else "live"
+                suffix_full = f"live · {suffix_full}" if suffix_full else "live"
+            new_rows.append((label, pct, suffix, suffix_full))
+        rows = new_rows
+
     if not rows:
         text.append("\n    ")
         text.append("usage unavailable", style=palette.muted)
@@ -244,7 +292,7 @@ def account_card_text(
                 pct,
                 suffix or None,
                 bar_width,
-                stale=stale,
+                stale=False if label in live_labels else stale,
                 threshold=threshold,
                 palette=palette,
             )
@@ -353,6 +401,7 @@ class AccountsPanel(Static):
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,
                         palette=palette, pinging=snap.pinging,
+                        hot_probe=snap.hot_probe,
                     )
                 )
             elif self._show_minis:
@@ -380,37 +429,56 @@ class AccountCard(Static):
         *,
         threshold: float | None = None,
         pinging: dict | None = None,
+        hot_probe: dict | None = None,
     ) -> None:
         super().__init__()
         self._acc = acc
         self._threshold = threshold
         self._pinging = pinging
+        self._hot_probe = hot_probe
 
-    def set_account(self, acc: AccountSnapshot, pinging: dict | None = None) -> None:
+    def set_account(
+        self,
+        acc: AccountSnapshot,
+        pinging: dict | None = None,
+        hot_probe: dict | None = None,
+    ) -> None:
         self._acc = acc
         self._pinging = pinging
+        self._hot_probe = hot_probe
         self.refresh(layout=True)
 
     def render(self) -> Text:
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
-            pinging=self._pinging,
+            pinging=self._pinging, hot_probe=self._hot_probe,
         )
 
 
 class AccountItem(ListItem):
     """ListView row wrapping an :class:`AccountCard`; remembers its slot."""
 
-    def __init__(self, acc: AccountSnapshot, *, pinging: dict | None = None) -> None:
-        super().__init__(AccountCard(acc, pinging=pinging))
+    def __init__(
+        self,
+        acc: AccountSnapshot,
+        *,
+        pinging: dict | None = None,
+        hot_probe: dict | None = None,
+    ) -> None:
+        super().__init__(AccountCard(acc, pinging=pinging, hot_probe=hot_probe))
         self.number = acc.number
         self.email = acc.email
 
-    def set_account(self, acc: AccountSnapshot, pinging: dict | None = None) -> None:
+    def set_account(
+        self,
+        acc: AccountSnapshot,
+        pinging: dict | None = None,
+        hot_probe: dict | None = None,
+    ) -> None:
         self.number = acc.number
         self.email = acc.email
-        self.query_one(AccountCard).set_account(acc, pinging)
+        self.query_one(AccountCard).set_account(acc, pinging, hot_probe)
 
 
 class MenuItem(ListItem):
